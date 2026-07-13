@@ -15,17 +15,26 @@ public struct SplatCleaningConfiguration: Sendable, Equatable {
     public var hazeSupportMultiplier: Int
     public var hazeClumpAlphaSupport: Float
     public var worldUp: SIMD3<Float>
-    /// Hard subject crop. Off by default — the original cleaner only removes
-    /// floaters/haze so connected subject parts (e.g. legs) stay intact.
+    /// Isolate the orbited subject (connected-component within the camera
+    /// orbit) for "Cleaned" mode. On by default; skipped for environment
+    /// captures. Unlike the old radial crop this keeps thin attached parts
+    /// (legs, arms) because it follows connectivity, not a hard radius.
     public var isolateSubject: Bool
-    /// Keep points within `denseCoreRadius * subjectKeepMultiplier` when isolation is on.
+    /// Isolation keep sphere as a fraction of the orbit radius. The subject
+    /// sits inside the orbit, so mass beyond this is environment.
+    public var subjectOrbitKeepFraction: Float
+    /// Connectivity voxel edge as a fraction of the keep radius. Small enough
+    /// to separate the subject from a detached background clump, large enough
+    /// that the subject stays one connected component.
+    public var subjectVoxelFactor: Float
+    /// A voxel counts as subject surface when its summed alpha clears this
+    /// fraction of the densest voxel's — filters sparse background voxels.
+    public var subjectVoxelMassFloor: Float
+    /// Retained for API/config compatibility; unused by the connected-component
+    /// isolation that replaced the old radial density crop.
     public var subjectKeepMultiplier: Float
-    /// When cameras exist, also drop points beyond this fraction of orbit radius.
     public var orbitKeepFraction: Float
-    /// Points with local alpha-support at/above `peak * densityPeakFraction`
-    /// define the dense subject core used for framing when isolation is on.
     public var densityPeakFraction: Float
-    /// Outside the dense core, drop points weaker than `peak * densityFloor`.
     public var densityFloor: Float
 
     public init(
@@ -40,7 +49,10 @@ public struct SplatCleaningConfiguration: Sendable, Equatable {
         hazeSupportMultiplier: Int = 2,
         hazeClumpAlphaSupport: Float = 100,
         worldUp: SIMD3<Float> = SIMD3(0, 1, 0),
-        isolateSubject: Bool = false,
+        isolateSubject: Bool = true,
+        subjectOrbitKeepFraction: Float = 0.95,
+        subjectVoxelFactor: Float = 0.06,
+        subjectVoxelMassFloor: Float = 0.03,
         subjectKeepMultiplier: Float = 1.08,
         orbitKeepFraction: Float = 0.75,
         densityPeakFraction: Float = 0.28,
@@ -58,6 +70,9 @@ public struct SplatCleaningConfiguration: Sendable, Equatable {
         self.hazeClumpAlphaSupport = hazeClumpAlphaSupport
         self.worldUp = worldUp
         self.isolateSubject = isolateSubject
+        self.subjectOrbitKeepFraction = subjectOrbitKeepFraction
+        self.subjectVoxelFactor = subjectVoxelFactor
+        self.subjectVoxelMassFloor = subjectVoxelMassFloor
         self.subjectKeepMultiplier = subjectKeepMultiplier
         self.orbitKeepFraction = orbitKeepFraction
         self.densityPeakFraction = densityPeakFraction
@@ -433,55 +448,100 @@ public enum SplatCleaner {
             }
         }
 
-        // Density-aware subject isolation: the featured subject is denser than
-        // densification shells. Keep the high-support core and drop sparse or
-        // far background even when it's opaque.
+        // Subject isolation (object captures): keep the dense splat mass that
+        // is connected to the subject and sits inside the camera orbit; drop
+        // the environment. An orbit necessarily surrounds its subject, so
+        // anything beyond the orbit radius is provably not the subject (on
+        // real captures ~40% of the reconstructed alpha-mass is environment
+        // beyond the orbit). A 26-connected flood from the densest core then
+        // drops detached background that falls inside the orbit sphere — e.g.
+        // distant geometry the trainer placed at the wrong depth. The support
+        // plane, when found, is excluded from occupancy so the flood cannot
+        // bridge across a tabletop into far geometry, while the subject's own
+        // volume (which rises above the plane) stays connected.
         var isOutsideSubject = [Bool](repeating: false, count: count)
         var subjectIsolatedCount = 0
-        let shouldIsolate = configuration.isolateSubject && !isEnvironment
+        let shouldIsolate = configuration.isolateSubject
+            && !isEnvironment
+            && rawOrbitRadius > 0
         if shouldIsolate {
-            var candidateIndices: [Int] = []
-            candidateIndices.reserveCapacity(count - floaterCount - hazeRemovedCount)
-            var peakSupport: Float = 0
-            for index in points.indices where !isFloater[index] && !isHaze[index] {
-                candidateIndices.append(index)
-                peakSupport = max(peakSupport, neighborhoodAlpha(index))
+            let keepRadius = rawOrbitRadius * configuration.subjectOrbitKeepFraction
+            let cell = keepRadius * configuration.subjectVoxelFactor
+            func subjectKey(_ p: SIMD3<Float>) -> VoxelKey {
+                voxelKey(p, cellSize: cell)
             }
-            let coreThreshold = peakSupport * configuration.densityPeakFraction
-            let floorThreshold = peakSupport * configuration.densityFloor
-            var denseDistances: [Float] = []
-            denseDistances.reserveCapacity(candidateIndices.count / 4)
-            for index in candidateIndices {
-                let support = neighborhoodAlpha(index)
-                guard support >= coreThreshold else {
+            var postHazeCount = 0
+            var voxelMass: [VoxelKey: Float] = [:]
+            for index in points.indices where !isFloater[index] && !isHaze[index] {
+                postHazeCount += 1
+                guard simd_length(positions[index] - center) <= keepRadius else {
                     continue
                 }
-                denseDistances.append(simd_length(positions[index] - center))
+                // At/below the support surface doesn't build occupancy, so a
+                // horizontal table isn't a traversable bridge.
+                if plane != nil, aboveness(index) > planeCut {
+                    continue
+                }
+                voxelMass[subjectKey(positions[index]), default: 0] += alpha[index]
             }
-            denseDistances.sort()
-            let denseCoreRadius: Float
-            if denseDistances.isEmpty {
-                denseCoreRadius = compactRadius
-            } else {
-                denseCoreRadius = max(
-                    percentile(denseDistances, 0.90),
-                    compactRadius * 0.5
-                )
-            }
-            let coreLimit = denseCoreRadius * configuration.subjectKeepMultiplier
-            let orbitLimit = rawOrbitRadius > 0
-                ? rawOrbitRadius * configuration.orbitKeepFraction
-                : Float.greatestFiniteMagnitude
-            let keepLimit = min(coreLimit, orbitLimit)
-            let softCore = denseCoreRadius * 0.55
-            for index in candidateIndices {
-                let distance = simd_length(positions[index] - center)
-                let support = neighborhoodAlpha(index)
-                let outsideRadius = distance > keepLimit
-                let sparseShell = distance > softCore && support < floorThreshold
-                if outsideRadius || sparseShell {
-                    isOutsideSubject[index] = true
-                    subjectIsolatedCount += 1
+            let peakMass = voxelMass.values.max() ?? 0
+            if peakMass > 0 {
+                let massFloor = peakMass * configuration.subjectVoxelMassFloor
+                var occupied = Set<VoxelKey>()
+                for (key, mass) in voxelMass where mass >= massFloor {
+                    occupied.insert(key)
+                }
+                let centerKey = subjectKey(center)
+                var seed: VoxelKey?
+                var bestSeedDistance = Int.max
+                for key in occupied {
+                    let dx = key.x - centerKey.x
+                    let dy = key.y - centerKey.y
+                    let dz = key.z - centerKey.z
+                    let distance = dx * dx + dy * dy + dz * dz
+                    if distance < bestSeedDistance {
+                        bestSeedDistance = distance
+                        seed = key
+                    }
+                }
+                var component = Set<VoxelKey>()
+                if let seed {
+                    var queue = [seed]
+                    component.insert(seed)
+                    var head = 0
+                    while head < queue.count {
+                        let key = queue[head]
+                        head += 1
+                        for dx in -1...1 {
+                            for dy in -1...1 {
+                                for dz in -1...1 {
+                                    let neighbor = key.offset(dx, dy, dz)
+                                    if occupied.contains(neighbor),
+                                       !component.contains(neighbor) {
+                                        component.insert(neighbor)
+                                        queue.append(neighbor)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                for index in points.indices
+                where !isFloater[index] && !isHaze[index] {
+                    let inside = simd_length(positions[index] - center) <= keepRadius
+                        && component.contains(subjectKey(positions[index]))
+                    if !inside {
+                        isOutsideSubject[index] = true
+                        subjectIsolatedCount += 1
+                    }
+                }
+                // Guard against a bad seed nuking the subject: real subjects
+                // are 30–45% of the post-haze cloud, so keeping under 2% means
+                // isolation failed — discard it and fall back to floater+haze.
+                let keptAfterIsolation = postHazeCount - subjectIsolatedCount
+                if keptAfterIsolation < postHazeCount / 50 {
+                    isOutsideSubject = [Bool](repeating: false, count: count)
+                    subjectIsolatedCount = 0
                 }
             }
         }

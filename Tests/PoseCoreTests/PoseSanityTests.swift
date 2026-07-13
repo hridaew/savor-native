@@ -14,13 +14,13 @@ final class PoseSanityTests: XCTestCase {
         XCTAssertThrowsError(
             try PoseSanity.validate(
                 frames: [frame],
-                totalImageCount: 2,
+                totalImageCount: 3,
                 points: [Vector3(x: 0, y: 0, z: 0)]
             )
         ) { error in
             XCTAssertEqual(
                 error as? PoseSanity.Error,
-                .insufficientCoverage(actual: 0.5, minimum: 0.9)
+                .insufficientCoverage(actual: 1.0 / 3.0, minimum: 0.5)
             )
         }
     }

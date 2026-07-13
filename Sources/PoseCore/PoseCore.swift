@@ -1,3 +1,4 @@
+import Foundation
 import simd
 
 public struct Vector3: Equatable, Sendable {
@@ -61,18 +62,42 @@ public struct PoseFrame: Equatable, Sendable {
 }
 
 public enum PoseSanity {
-    public enum Error: Swift.Error, Equatable {
+    public enum Error: Swift.Error, Equatable, LocalizedError {
         case insufficientCoverage(actual: Double, minimum: Double)
         case emptyPointCloud
         case camerasNotFacingPointCloud(actual: Double, minimum: Double)
         case cameraPathNotRingLike(actual: Double, minimum: Double)
+
+        public var errorDescription: String? {
+            switch self {
+            case let .insufficientCoverage(actual, minimum):
+                "Only \(Int(actual * 100))% of frames could be located "
+                    + "(need \(Int(minimum * 100))%). Try a slower, steadier "
+                    + "orbit with the subject filling more of the frame."
+            case .emptyPointCloud:
+                "No 3D structure could be recovered from the video."
+            case let .camerasNotFacingPointCloud(actual, _):
+                "The camera path doesn't consistently face one subject "
+                    + "(\(Int(actual * 100))% aligned). Orbit around a single object."
+            case let .cameraPathNotRingLike(actual, _):
+                "The camera path isn't a clean orbit "
+                    + "(\(Int(actual * 100))% ring-like). Circle the subject once, evenly."
+            }
+        }
     }
+
+    /// Coverage floor is deliberately loose: real handheld captures drop
+    /// blurry frames, and ~half the frames registered (e.g. 75 of 150) still
+    /// trains well. The facing-the-subject and ring-shape checks below are the
+    /// real quality guards — they reject a genuinely failed reconstruction,
+    /// whereas a low frame count with good poses is just a shorter usable orbit.
+    public static let defaultMinimumCoverage = 0.5
 
     public static func validate(
         frames: [PoseFrame],
         totalImageCount: Int,
         points: [Vector3],
-        minimumCoverage: Double = 0.9
+        minimumCoverage: Double = PoseSanity.defaultMinimumCoverage
     ) throws {
         let coverage = totalImageCount > 0
             ? Double(frames.count) / Double(totalImageCount)

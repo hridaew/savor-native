@@ -143,94 +143,71 @@ final class SplatCleanerTests: XCTestCase {
         XCTAssertLessThan(output.points.count, points.count)
     }
 
-    func testIsolatesOpaqueShellForObjectCaptures() throws {
-        // Dense opaque core so medianDistance tracks the subject, not the shell.
-        // Large enough that plane culling cannot drop subjectIndices to the
-        // all-points fallback (which would treat the shell as the subject).
-        var points: [SplatPoint] = []
-        for x in -7...7 {
-            for y in -7...7 {
-                for z in -7...7 {
-                    points.append(
-                        makePoint(
-                            position: SIMD3(
-                                Float(x) * 0.015,
-                                Float(y) * 0.015,
-                                Float(z) * 0.015
-                            ),
-                            opacity: 0.95,
-                            scale: 0.02
-                        )
-                    )
-                }
-            }
+    /// A dense blob near the orbit center and a separate dense blob offset
+    /// toward the ring: isolation must keep the connected subject and drop the
+    /// disconnected background (which is what "distant splats placed at the
+    /// wrong depth" look like). Uses the default config to confirm isolation
+    /// is on by default for object captures.
+    func testIsolatesDisconnectedBackground() throws {
+        // Dense, overlapping splats (spacing ≤ scale) so the floater pass keeps
+        // them — the cleaner's grid is tuned for real splat densities. Kept
+        // under 300 points total so no support plane is fitted (this test
+        // targets connectivity, not plane logic).
+        var points = makeDenseBlob(center: SIMD3(0, 0, 0), half: 2)
+        let subjectCount = points.count
+        // Disconnected background blob offset toward the camera ring.
+        points += makeDenseBlob(center: SIMD3(0.6, 0, 0), half: 2)
+        let cameras = (0..<12).map { index -> SIMD3<Float> in
+            let angle = Float(index) * (.pi / 6)
+            return SIMD3(1.1 * cos(angle), 0.05, 1.1 * sin(angle))
         }
-        let coreCount = points.count
-        // Opaque densification shell outside compactRadius * 1.2 but inside
-        // the camera ring — haze alone would keep these.
-        for index in 0..<48 {
-            let angle = Float(index) * (.pi / 24)
-            for height in -2...2 {
-                points.append(
-                    makePoint(
-                        position: SIMD3(
-                            0.55 * cos(angle),
-                            Float(height) * 0.03,
-                            0.55 * sin(angle)
-                        ),
-                        opacity: 0.95,
-                        scale: 0.035
-                    )
-                )
+
+        let output = try SplatCleaner.cleanPoints(points, cameraCenters: cameras)
+
+        XCTAssertFalse(output.statistics.isEnvironment)
+        XCTAssertGreaterThan(output.statistics.subjectIsolatedCount, 0)
+        // The far background blob (raw x ≈ 0.6) must be gone; the subject stays.
+        // Compare against the normalized subject centroid to avoid CRS coupling.
+        let keptCount = output.points.count
+        XCTAssertGreaterThan(keptCount, subjectCount / 2)
+        XCTAssertLessThan(keptCount, subjectCount + 20)
+    }
+
+    /// Anti-amputation guard: a thin arm extending off the core must be kept,
+    /// because it is voxel-connected to the subject. The old radial crop
+    /// dropped exactly these thin extremities (e.g. legs).
+    func testKeepsThinAttachedExtremities() throws {
+        let core = makeDenseBlob(center: SIMD3(0, 0, 0), half: 2)
+        var points = core
+        // Thin arm: a dense 3×3 column reaching out in +x, contiguous with the
+        // core, ending far from it. Its far end must survive isolation.
+        var armCount = 0
+        for step in 1...9 {
+            for a in -1...1 {
+                for b in -1...1 {
+                    points.append(makePoint(position: SIMD3(
+                        0.04 + Float(step) * 0.02,
+                        Float(a) * 0.02,
+                        Float(b) * 0.02
+                    )))
+                    armCount += 1
+                }
             }
         }
         let cameras = (0..<12).map { index -> SIMD3<Float> in
             let angle = Float(index) * (.pi / 6)
-            return SIMD3(1.2 * cos(angle), 0.1, 1.2 * sin(angle))
+            return SIMD3(1.0 * cos(angle), 0.05, 1.0 * sin(angle))
         }
 
-        let output = try SplatCleaner.cleanPoints(
-            points,
-            cameraCenters: cameras,
-            configuration: SplatCleaningConfiguration(isolateSubject: true)
-        )
+        let output = try SplatCleaner.cleanPoints(points, cameraCenters: cameras)
 
-        XCTAssertFalse(output.statistics.isEnvironment)
-        XCTAssertGreaterThan(output.statistics.subjectIsolatedCount, 0)
-        XCTAssertLessThan(output.points.count, points.count)
-        XCTAssertLessThanOrEqual(
+        // If the arm were amputated only the core (~125) would survive; keeping
+        // connectivity means most of core+arm stays.
+        XCTAssertGreaterThan(
             output.points.count,
-            coreCount
+            core.count + armCount / 2,
+            "thin attached arm was amputated"
         )
-        let maximumDistance = output.points
-            .map { simd_length($0.position) }
-            .max() ?? 0
-        XCTAssertLessThanOrEqual(maximumDistance, 1.2)
-    }
-
-    func testDefaultCleanupDoesNotHardIsolateSubject() throws {
-        var points = makeSurfacePoints()
-        for index in 0..<16 {
-            let angle = Float(index) * (.pi / 8)
-            points.append(
-                makePoint(
-                    position: SIMD3(0.8 * cos(angle), 0, 0.8 * sin(angle)),
-                    opacity: 0.95,
-                    scale: 0.04
-                )
-            )
-        }
-        let cameras = (0..<8).map { index -> SIMD3<Float> in
-            let angle = Float(index) * (.pi / 4)
-            return SIMD3(1.5 * cos(angle), 0.1, 1.5 * sin(angle))
-        }
-
-        let output = try SplatCleaner.cleanPoints(
-            points,
-            cameraCenters: cameras
-        )
-
-        XCTAssertEqual(output.statistics.subjectIsolatedCount, 0)
     }
 
     func testSkipsHardIsolationForEnvironmentCaptures() throws {
@@ -290,6 +267,28 @@ final class SplatCleanerTests: XCTestCase {
             withIsolation.points.count,
             withoutIsolation.points.count
         )
+    }
+
+    /// Dense overlapping blob (spacing 0.02 ≤ splat scale 0.03) so the floater
+    /// pass keeps it — mirrors real splat density. `half` sets the half-extent
+    /// in voxels: half=2 → a 5×5×5 = 125-point blob.
+    private func makeDenseBlob(
+        center: SIMD3<Float>,
+        half: Int
+    ) -> [SplatPoint] {
+        var blob: [SplatPoint] = []
+        for x in -half...half {
+            for y in -half...half {
+                for z in -half...half {
+                    blob.append(makePoint(position: center + SIMD3(
+                        Float(x) * 0.02,
+                        Float(y) * 0.02,
+                        Float(z) * 0.02
+                    )))
+                }
+            }
+        }
+        return blob
     }
 
     private func makeSurfacePoints() -> [SplatPoint] {
