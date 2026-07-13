@@ -1,0 +1,9 @@
+.build/
+.swiftpm/
+.DS_Store
+phase0/
+# Generated training outputs / large PLY artifacts — not source.
+phase2/artifacts/
+phase2/artifacts-archive/
+.phase2-smoke/
+target/
