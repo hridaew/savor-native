@@ -455,10 +455,15 @@ public enum SplatCleaner {
         // real captures ~40% of the reconstructed alpha-mass is environment
         // beyond the orbit). A 26-connected flood from the densest core then
         // drops detached background that falls inside the orbit sphere — e.g.
-        // distant geometry the trainer placed at the wrong depth. The support
-        // plane, when found, is excluded from occupancy so the flood cannot
-        // bridge across a tabletop into far geometry, while the subject's own
-        // volume (which rises above the plane) stays connected.
+        // distant geometry the trainer placed at the wrong depth.
+        //
+        // Tables/floors are handled by column support, not by excluding the
+        // whole plane: a table is a horizontal sheet whose outer parts have
+        // nothing above them, whereas a subject's lower body (legs) always has
+        // the torso in the same vertical column. So a below-plane voxel is kept
+        // only when its column also holds above-plane occupancy. This trims a
+        // tabletop without ever amputating legs — even when the support-plane
+        // RANSAC mis-fits a horizontal band through the middle of a figure.
         var isOutsideSubject = [Bool](repeating: false, count: count)
         var subjectIsolatedCount = 0
         let shouldIsolate = configuration.isolateSubject
@@ -470,25 +475,52 @@ public enum SplatCleaner {
             func subjectKey(_ p: SIMD3<Float>) -> VoxelKey {
                 voxelKey(p, cellSize: cell)
             }
+            // Horizontal basis perpendicular to the capture's up axis.
+            var horizontalU = simd_cross(worldUp, SIMD3<Float>(1, 0, 0))
+            if simd_length(horizontalU) < 0.1 {
+                horizontalU = simd_cross(worldUp, SIMD3<Float>(0, 0, 1))
+            }
+            horizontalU = simd_normalize(horizontalU)
+            let horizontalV = simd_normalize(simd_cross(worldUp, horizontalU))
+            func columnKey(_ p: SIMD3<Float>) -> Int64 {
+                let d = p - center
+                let a = Int64(floor(simd_dot(d, horizontalU) / cell))
+                let b = Int64(floor(simd_dot(d, horizontalV) / cell))
+                return a &* 1_000_003 &+ b
+            }
             var postHazeCount = 0
             var voxelMass: [VoxelKey: Float] = [:]
+            var voxelHasAbove: [VoxelKey: Bool] = [:]
+            var voxelColumn: [VoxelKey: Int64] = [:]
+            var columnsWithBodyAbove = Set<Int64>()
             for index in points.indices where !isFloater[index] && !isHaze[index] {
                 postHazeCount += 1
                 guard simd_length(positions[index] - center) <= keepRadius else {
                     continue
                 }
-                // At/below the support surface doesn't build occupancy, so a
-                // horizontal table isn't a traversable bridge.
-                if plane != nil, aboveness(index) > planeCut {
-                    continue
+                let key = subjectKey(positions[index])
+                voxelMass[key, default: 0] += alpha[index]
+                voxelColumn[key] = columnKey(positions[index])
+                // "Above the surface" (or no plane at all) counts as body mass.
+                if plane == nil || aboveness(index) <= planeCut {
+                    voxelHasAbove[key] = true
+                    columnsWithBodyAbove.insert(columnKey(positions[index]))
                 }
-                voxelMass[subjectKey(positions[index]), default: 0] += alpha[index]
             }
             let peakMass = voxelMass.values.max() ?? 0
             if peakMass > 0 {
                 let massFloor = peakMass * configuration.subjectVoxelMassFloor
                 var occupied = Set<VoxelKey>()
                 for (key, mass) in voxelMass where mass >= massFloor {
+                    // Drop a purely below-plane voxel only when nothing in its
+                    // vertical column is above the plane (a table's outer sheet);
+                    // a leg's column has the torso above it, so it survives.
+                    if plane != nil,
+                       voxelHasAbove[key] != true,
+                       let column = voxelColumn[key],
+                       !columnsWithBodyAbove.contains(column) {
+                        continue
+                    }
                     occupied.insert(key)
                 }
                 let centerKey = subjectKey(center)

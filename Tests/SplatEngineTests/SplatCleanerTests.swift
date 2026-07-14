@@ -210,6 +210,59 @@ final class SplatCleanerTests: XCTestCase {
         )
     }
 
+    /// Regression for the "cut in half" bug: a tall figure standing through a
+    /// horizontal floor sheet. The support plane sits at the figure's mid
+    /// height, but the lower body must survive (its column has the torso above
+    /// it) while the floor sheet's outer extent is trimmed.
+    func testDoesNotAmputateLowerBodyThroughSupportPlane() throws {
+        var points: [SplatPoint] = []
+        // Wide, dense horizontal floor sheet at y = 0 (triggers plane RANSAC).
+        for x in -12...12 {
+            for z in -12...12 {
+                points.append(makePoint(position: SIMD3(
+                    Float(x) * 0.02, 0, Float(z) * 0.02
+                )))
+            }
+        }
+        // Tall figure through the sheet: a 3×3 column spanning y ∈ [-0.16, 0.16].
+        var lowerBodyCount = 0
+        for yi in -8...8 {
+            for a in -1...1 {
+                for b in -1...1 {
+                    let y = Float(yi) * 0.02
+                    points.append(makePoint(position: SIMD3(
+                        Float(a) * 0.02, y, Float(b) * 0.02
+                    )))
+                    if y < -0.02 { lowerBodyCount += 1 }
+                }
+            }
+        }
+        let cameras = (0..<16).map { index -> SIMD3<Float> in
+            let angle = Float(index) * (.pi / 8)
+            return SIMD3(0.9 * cos(angle), 0.1, 0.9 * sin(angle))
+        }
+
+        let output = try SplatCleaner.cleanPoints(points, cameraCenters: cameras)
+
+        // The lower body (y < 0, under the torso) must survive. Positions are
+        // normalized but the figure is centered near the origin, so lower-body
+        // points stay negative-y.
+        let keptLowerBody = output.points.filter { $0.position.y < -0.02 }.count
+        XCTAssertGreaterThan(
+            keptLowerBody,
+            lowerBodyCount / 2,
+            "lower body amputated at the support plane"
+        )
+        // The 625-point floor sheet (no body above its outer parts) must be
+        // largely trimmed — the figure (~153 points) plus a small base is well
+        // under the untrimmed total.
+        XCTAssertLessThan(
+            output.points.count,
+            400,
+            "distant floor sheet not trimmed"
+        )
+    }
+
     func testSkipsHardIsolationForEnvironmentCaptures() throws {
         var points: [SplatPoint] = []
         for x in -5...5 {

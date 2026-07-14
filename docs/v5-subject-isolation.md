@@ -51,10 +51,13 @@ camera ring:
    the center. Keep only the reached component — this drops detached
    background *inside* the sphere (the wrong-depth splats) while following
    connectivity through thin parts, so legs/arms/boots are **not** amputated.
-3. **Plane exclusion** — points at/below the detected support plane don't
-   build occupancy, so the flood can't bridge across a tabletop into far
-   geometry. The subject's own volume rises above the plane and stays
-   connected.
+3. **Column support** (not blanket plane exclusion) — a below-plane voxel is
+   dropped only when nothing in its *vertical column* is above the plane. A
+   table's outer sheet has nothing above it → trimmed; a figure's legs have
+   the torso above them → kept. This trims tabletops without amputating legs
+   **even when the support-plane RANSAC mis-fits a horizontal band through the
+   middle of a tall figure** (the KAWS astronaut was cut at the waist by the
+   earlier blanket-exclusion version — this rule fixed it).
 4. **Fallback** — real subjects are 30–45% of the post-haze cloud; if
    isolation keeps under 2%, a bad seed is assumed and it reverts to
    floater+haze (never ships an empty scene).
@@ -81,6 +84,8 @@ eyeballed during development.
   background dropped.
 - `testKeepsThinAttachedExtremities` — anti-amputation: a thin arm attached to
   the core survives (the exact property the old radial crop broke).
+- `testDoesNotAmputateLowerBodyThroughSupportPlane` — a tall figure through a
+  floor sheet keeps its lower body (column support) while the sheet is trimmed.
 - `testSkipsHardIsolationForEnvironmentCaptures` — rooms still skip isolation.
 - `PoseSanityTests` — coverage floor now 0.5.
 
