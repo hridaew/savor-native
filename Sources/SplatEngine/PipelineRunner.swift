@@ -34,10 +34,14 @@ public enum PipelineStage: String, Sendable, Equatable {
 public struct PipelineProgress: Sendable, Equatable {
     public let stage: PipelineStage
     public let fraction: Double
+    /// Human-readable line describing exactly what the pipeline is doing
+    /// right now (e.g. "msplat step 8,214 / 15,000").
+    public let detail: String?
 
-    public init(stage: PipelineStage, fraction: Double) {
+    public init(stage: PipelineStage, fraction: Double, detail: String? = nil) {
         self.stage = stage
         self.fraction = fraction
+        self.detail = detail
     }
 }
 
@@ -122,7 +126,8 @@ public struct PipelineRunner: Sendable {
 
         await progress?(PipelineProgress(
             stage: .extractingFrames,
-            fraction: 0
+            fraction: 0,
+            detail: "Scoring frame sharpness with AVFoundation"
         ))
         let extraction = try await frameExtractor.extract(
             videoURL: videoURL,
@@ -131,7 +136,10 @@ public struct PipelineRunner: Sendable {
             progress: { extractionProgress in
                 await progress?(PipelineProgress(
                     stage: .extractingFrames,
-                    fraction: extractionProgress.fraction
+                    fraction: extractionProgress.fraction,
+                    detail: "Decoding sharpest frame "
+                        + "\(extractionProgress.completedFrames) of "
+                        + "\(extractionProgress.totalFrames)"
                 ))
             }
         )
@@ -157,24 +165,31 @@ public struct PipelineRunner: Sendable {
             meshOutputURL: meshURL,
             progress: { poseProgress in
                 let stage: PipelineStage
+                let detail: String
                 switch poseProgress.stage {
                 case .poses:
                     stage = .estimatingPoses
+                    detail = "PhotogrammetrySession registering camera poses"
                 case .pointCloud:
                     stage = .buildingPointCloud
+                    detail = "Fusing sparse point cloud from registered views"
                 case .mesh:
                     stage = .buildingPointCloud
+                    detail = "Reconstructing preview mesh"
                 }
                 await progress?(PipelineProgress(
                     stage: stage,
-                    fraction: poseProgress.fraction
+                    fraction: poseProgress.fraction,
+                    detail: detail
                 ))
             }
         )
 
         await progress?(PipelineProgress(
             stage: .writingDataset,
-            fraction: 0
+            fraction: 0,
+            detail: "Writing Nerfstudio dataset "
+                + "(\(poseEstimation.frames.count) posed frames)"
         ))
         try PoseDatasetWriter.write(
             poseEstimation,
@@ -183,10 +198,17 @@ public struct PipelineRunner: Sendable {
         )
         await progress?(PipelineProgress(
             stage: .writingDataset,
-            fraction: 1
+            fraction: 1,
+            detail: "Dataset ready — transforms.json + sparse points"
         ))
 
-        await progress?(PipelineProgress(stage: .training, fraction: 0))
+        let totalSteps = trainingOptions.totalSteps
+        await progress?(PipelineProgress(
+            stage: .training,
+            fraction: 0,
+            detail: "Starting msplat Metal trainer "
+                + "(\(totalSteps.formatted()) steps)"
+        ))
         let training = try await trainer.train(
             datasetURL: datasetURL,
             outputURL: trainingURL,
@@ -194,14 +216,20 @@ public struct PipelineRunner: Sendable {
             progress: { trainingProgress in
                 await progress?(PipelineProgress(
                     stage: .training,
-                    fraction: trainingProgress.fraction
+                    fraction: trainingProgress.fraction,
+                    detail: "msplat step "
+                        + "\(trainingProgress.completedSteps.formatted())"
+                        + " of "
+                        + "\(trainingProgress.totalSteps.formatted())"
                 ))
             }
         )
 
         await progress?(PipelineProgress(
             stage: .postprocessing,
-            fraction: 0
+            fraction: 0,
+            detail: "Cleaning \(training.gaussianCount.formatted()) Gaussians"
+                + " — floaters, haze, subject isolation"
         ))
         let sceneURL = outputURL.appendingPathComponent("scene-hq.ply")
         let cameraCenters = poseEstimation.frames.map { frame in
@@ -219,7 +247,9 @@ public struct PipelineRunner: Sendable {
         )
         await progress?(PipelineProgress(
             stage: .postprocessing,
-            fraction: 1
+            fraction: 1,
+            detail: "Kept \(cleaning.keptCount.formatted()) of "
+                + "\(cleaning.totalCount.formatted()) Gaussians"
         ))
 
         return PipelineResult(

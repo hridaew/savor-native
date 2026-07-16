@@ -345,17 +345,20 @@ final class SplatCleanerTests: XCTestCase {
     }
 
     private func makeSurfacePoints() -> [SplatPoint] {
-        (-1...1).flatMap { x in
-            (-1...1).flatMap { y in
-                (-1...1).map { z in
-                    makePoint(position: SIMD3(
+        var points: [SplatPoint] = []
+        for x in -1...1 {
+            for y in -1...1 {
+                for z in -1...1 {
+                    let position = SIMD3<Float>(
                         Float(x) * 0.02,
                         Float(y) * 0.02,
                         Float(z) * 0.02
-                    ))
+                    )
+                    points.append(makePoint(position: position))
                 }
             }
         }
+        return points
     }
 
     private func makePoint(

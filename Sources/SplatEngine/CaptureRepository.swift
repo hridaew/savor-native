@@ -271,6 +271,23 @@ public actor CaptureRepository {
         return updated
     }
 
+    /// Permanently removes a capture's workspace (source video, frames,
+    /// dataset, training output, splats). Missing workspaces are a no-op so
+    /// deletes are idempotent.
+    public func delete(_ id: UUID) throws {
+        let workspaceURL = workspaceURL(for: id)
+        guard FileManager.default.fileExists(atPath: workspaceURL.path) else {
+            return
+        }
+        _ = TrainerProcessRecovery.terminateStaleProcess(
+            in: workspaceURL.appendingPathComponent(
+                "training",
+                isDirectory: true
+            )
+        )
+        try FileManager.default.removeItem(at: workspaceURL)
+    }
+
     public func migrateLegacyCompletedCaptures(
         postprocessor: any SplatPostprocessing =
             NativeSplatPostprocessor()

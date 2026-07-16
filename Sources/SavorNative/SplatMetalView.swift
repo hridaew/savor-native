@@ -3,12 +3,21 @@ import MetalKit
 import SplatEngine
 import SwiftUI
 
+/// Hands the live renderer to SwiftUI so toolbar actions (snapshot, orbit
+/// video, live-clean scrubbing) can reach it.
+@MainActor
+final class SplatViewerProxy: ObservableObject {
+    weak var renderer: SplatViewRenderer?
+}
+
 struct SplatMetalView: NSViewRepresentable {
     let url: URL
     @Binding var status: ViewerStatus
     let resetToken: Int
     let autoRotate: Bool
     let verticalAxis: ViewerVerticalAxis
+    var customCleanFraction: Float?
+    var proxy: SplatViewerProxy?
 
     @MainActor
     final class Coordinator: NSObject {
@@ -96,9 +105,11 @@ struct SplatMetalView: NSViewRepresentable {
             return view
         }
         context.coordinator.renderer = renderer
+        proxy?.renderer = renderer
         view.delegate = renderer
             renderer.setAutoRotate(autoRotate)
             renderer.setVerticalAxis(verticalAxis)
+            renderer.setCustomCleanFraction(customCleanFraction)
         view.onScroll = { [weak renderer] delta in
             renderer?.scroll(by: Float(delta))
         }
@@ -137,8 +148,13 @@ struct SplatMetalView: NSViewRepresentable {
 
     func updateNSView(_ view: MTKView, context: Context) {
         context.coordinator.status = $status
+        if let proxy, proxy.renderer !== context.coordinator.renderer {
+            proxy.renderer = context.coordinator.renderer
+        }
             context.coordinator.renderer?.setAutoRotate(autoRotate)
             context.coordinator.renderer?.setVerticalAxis(verticalAxis)
+            context.coordinator.renderer?
+                .setCustomCleanFraction(customCleanFraction)
             if context.coordinator.appliedResetToken != resetToken {
                 context.coordinator.appliedResetToken = resetToken
                 context.coordinator.renderer?.resetCamera()

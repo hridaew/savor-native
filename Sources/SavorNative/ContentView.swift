@@ -3,14 +3,29 @@ import SplatEngine
 import SwiftUI
 import UniformTypeIdentifiers
 
+/// Which pass of the capture the viewer is showing. `custom` reveals a live
+/// scrubber that melts the raw scene toward the isolated subject.
+enum SplatViewMode: Hashable {
+    case cleaned
+    case custom
+    case unfiltered
+}
+
 struct ContentView: View {
     @EnvironmentObject private var model: AppModel
+    @StateObject private var audio = CaptureAudioController()
+    @StateObject private var viewerProxy = SplatViewerProxy()
     @State private var isImportingVideo = false
     @State private var viewerStatus: ViewerStatus = .idle
     @State private var viewerResetToken = 0
     @State private var viewerAutoRotate = false
     @State private var viewerVerticalAxis: ViewerVerticalAxis = .yUp
-    @State private var showUnfilteredSplat = false
+    @State private var viewMode: SplatViewMode = .cleaned
+    @State private var cleanAmount = 0.5
+    @State private var captureToDelete: CaptureRecord?
+    @State private var isShowingTips = false
+    @State private var videoExportProgress: Double?
+    @State private var videoExportTask: Task<Void, Never>?
     private let cliSplatURL: URL?
 
     init() {
@@ -37,7 +52,7 @@ struct ContentView: View {
                 captureBrowser
             }
         }
-        .frame(minWidth: 820, minHeight: 580)
+        .frame(minWidth: 860, minHeight: 600)
         .fileImporter(
             isPresented: $isImportingVideo,
             allowedContentTypes: [.movie],
@@ -61,10 +76,12 @@ struct ContentView: View {
         )
     }
 
+    // MARK: - Browser
+
     private var captureBrowser: some View {
         NavigationSplitView {
             sidebar
-                .navigationSplitViewColumnWidth(min: 220, ideal: 260)
+                .navigationSplitViewColumnWidth(min: 230, ideal: 270)
         } detail: {
             captureDetail
         }
@@ -79,8 +96,32 @@ struct ContentView: View {
             return true
         }
         .onChange(of: model.selectedCaptureID) { _, _ in
-            showUnfilteredSplat = false
+            viewMode = .cleaned
             viewerResetToken += 1
+            videoExportTask?.cancel()
+            audio.stop()
+        }
+        .confirmationDialog(
+            "Delete “\(captureToDelete?.sourceFilename ?? "capture")”?",
+            isPresented: Binding(
+                get: { captureToDelete != nil },
+                set: { if !$0 { captureToDelete = nil } }
+            ),
+            titleVisibility: .visible,
+            presenting: captureToDelete
+        ) { capture in
+            Button("Delete Capture", role: .destructive) {
+                model.deleteCapture(capture)
+                captureToDelete = nil
+            }
+            Button("Cancel", role: .cancel) {
+                captureToDelete = nil
+            }
+        } message: { _ in
+            Text(
+                "The saved video and generated splat are removed from "
+                    + "Savor's library. This can't be undone."
+            )
         }
     }
 
@@ -128,8 +169,32 @@ struct ContentView: View {
                 ) { capture in
                     CaptureRow(capture: capture)
                         .tag(capture.id)
+                        .contextMenu {
+                            if capture.state == .completed,
+                               let splatURL = model.splatURL(for: capture) {
+                                Button("Reveal Splat in Finder") {
+                                    NSWorkspace.shared
+                                        .activateFileViewerSelecting([splatURL])
+                                }
+                            }
+                            if !capture.state.isInFlight {
+                                Button("Start Over from Saved Video") {
+                                    model.retry(capture)
+                                }
+                                Divider()
+                                Button("Delete Capture…", role: .destructive) {
+                                    captureToDelete = capture
+                                }
+                            }
+                        }
                 }
                 .listStyle(.sidebar)
+                .onDeleteCommand {
+                    if let capture = model.selectedCapture,
+                       !capture.state.isInFlight {
+                        captureToDelete = capture
+                    }
+                }
             }
 
             Divider()
@@ -151,17 +216,7 @@ struct ContentView: View {
         if let capture = model.selectedCapture {
             switch capture.state {
             case .completed:
-                if let url = model.splatURL(
-                    for: capture,
-                    unfiltered: showUnfilteredSplat
-                ) ?? model.splatURL(for: capture) {
-                    completedViewer(url: url, capture: capture)
-                } else {
-                    failureView(
-                        capture,
-                        message: "The finished splat is missing."
-                    )
-                }
+                completedDetail(capture)
             case .failed, .cancelled, .interrupted:
                 failureView(
                     capture,
@@ -176,6 +231,29 @@ struct ContentView: View {
             dropView
         }
     }
+
+    @ViewBuilder
+    private func completedDetail(_ capture: CaptureRecord) -> some View {
+        let cleanedURL = model.splatURL(for: capture)
+        let rawURL = model.splatURL(for: capture, unfiltered: true)
+        let activeURL: URL? = switch viewMode {
+        case .cleaned:
+            cleanedURL ?? rawURL
+        case .custom, .unfiltered:
+            rawURL ?? cleanedURL
+        }
+        if let activeURL {
+            completedViewer(
+                url: activeURL,
+                capture: capture,
+                hasRawSplat: rawURL != nil
+            )
+        } else {
+            failureView(capture, message: "The finished splat is missing.")
+        }
+    }
+
+    // MARK: - Empty state
 
     private var dropView: some View {
         ZStack {
@@ -205,8 +283,16 @@ struct ContentView: View {
                 .controlSize(.large)
                 .tint(.white)
                 .foregroundStyle(.black)
-                Button("Open sample splat") {
-                    model.openBundledSample()
+                HStack(spacing: 12) {
+                    Button("Open sample splat") {
+                        model.openBundledSample()
+                    }
+                    Button("Filming tips") {
+                        isShowingTips = true
+                    }
+                    .popover(isPresented: $isShowingTips) {
+                        CaptureTipsView()
+                    }
                 }
                 .buttonStyle(.bordered)
                 .tint(.white)
@@ -215,6 +301,8 @@ struct ContentView: View {
         }
     }
 
+    // MARK: - Processing
+
     private func processingView(_ capture: CaptureRecord) -> some View {
         let progress = model.runningCaptureID == capture.id
             ? model.pipelineProgress
@@ -222,6 +310,8 @@ struct ContentView: View {
         let previewURL = model.runningCaptureID == capture.id
             ? model.instantPreviewURL
             : model.previewURL(for: capture)
+        let isCheckpoint = previewURL?.lastPathComponent
+            .hasPrefix("splat_") == true
         return ZStack {
             if let previewURL {
                 SplatMetalView(
@@ -234,57 +324,108 @@ struct ContentView: View {
                 .ignoresSafeArea()
             } else {
                 atmosphericBackground
-            }
-            VStack(spacing: 30) {
-                if previewURL != nil {
-                    Text("INSTANT PREVIEW")
-                        .font(.system(
-                            size: 11,
-                            weight: .bold,
-                            design: .monospaced
-                        ))
-                        .tracking(2.2)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 6)
-                        .background(.orange.opacity(0.85), in: Capsule())
-                        .foregroundStyle(.black)
-                }
-                VStack(spacing: 7) {
-                    Text("BUILDING SCENE")
-                        .font(.system(
-                            size: 11,
-                            weight: .bold,
-                            design: .monospaced
-                        ))
-                        .tracking(2.2)
+                VStack(spacing: 12) {
+                    Image(systemName: "circle.dotted")
+                        .font(.system(size: 42, weight: .thin))
+                        .foregroundStyle(.white.opacity(0.4))
+                    Text("First preview lands after the first "
+                        + "training checkpoint.")
+                        .font(.callout)
                         .foregroundStyle(.white.opacity(0.55))
-                    Text(stageTitle(progress?.stage, fallback: capture.state))
-                        .font(.system(size: 31, weight: .medium, design: .serif))
-                        .foregroundStyle(.white)
                 }
+            }
 
-                ProgressView(value: progress?.fraction ?? 0)
-                    .progressViewStyle(.linear)
-                    .tint(.white)
-                    .frame(maxWidth: 420)
+            VStack {
+                HStack {
+                    if previewURL != nil {
+                        Text(isCheckpoint ? "TRAINING PREVIEW — LIVE"
+                            : "INSTANT PREVIEW")
+                            .font(.system(
+                                size: 10,
+                                weight: .bold,
+                                design: .monospaced
+                            ))
+                            .tracking(2)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 5)
+                            .background(
+                                isCheckpoint
+                                    ? AnyShapeStyle(.green.opacity(0.85))
+                                    : AnyShapeStyle(.orange.opacity(0.85)),
+                                in: Capsule()
+                            )
+                            .foregroundStyle(.black)
+                            .transition(.opacity)
+                    }
+                    Spacer()
+                }
+                Spacer()
+                processingDebugBar(capture, progress: progress)
+            }
+            .padding(16)
+        }
+        .animation(.easeOut(duration: 0.25), value: previewURL)
+    }
 
+    /// Bottom console: what the pipeline is doing right now, verbatim,
+    /// with the stage rail and a thin determinate bar.
+    private func processingDebugBar(
+        _ capture: CaptureRecord,
+        progress: PipelineProgress?
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(stageTitle(progress?.stage, fallback: capture.state))
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(.white)
+                Spacer()
                 Text("\(Int(((progress?.fraction ?? 0) * 100).rounded()))%")
-                    .font(.system(size: 13, design: .monospaced))
-                    .foregroundStyle(.white.opacity(0.6))
-
-                StageRail(current: progress?.stage)
-                    .frame(maxWidth: 580)
-
+                    .font(.system(size: 12, design: .monospaced))
+                    .monospacedDigit()
+                    .foregroundStyle(.white.opacity(0.65))
                 if model.runningCaptureID == capture.id {
                     Button("Cancel", role: .destructive) {
                         model.cancelCurrentCapture()
                     }
                     .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .tint(.white)
                 }
             }
-            .padding(50)
+
+            ProgressView(value: progress?.fraction ?? 0)
+                .progressViewStyle(.linear)
+                .tint(.white)
+                .controlSize(.small)
+
+            HStack(alignment: .center, spacing: 14) {
+                Text(progress?.detail ?? capture.state.displayName)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.6))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer()
+                StageRail(current: progress?.stage)
+                    .frame(width: 300)
+            }
         }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 14)
+        .background(
+            .black.opacity(0.6),
+            in: RoundedRectangle(cornerRadius: 14, style: .continuous)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(.white.opacity(0.08), lineWidth: 1)
+        )
+        .shadow(color: .black.opacity(0.35), radius: 18, y: 8)
+        .shadow(color: .black.opacity(0.18), radius: 3, y: 1)
+        .frame(maxWidth: 760)
+        .animation(.easeOut(duration: 0.2), value: progress?.detail)
     }
+
+    // MARK: - Failure
 
     private func failureView(
         _ capture: CaptureRecord,
@@ -306,21 +447,32 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
                     .frame(maxWidth: 440)
-                Button("Start over from saved video") {
-                    model.retry(capture)
+                HStack(spacing: 12) {
+                    Button("Start over from saved video") {
+                        model.retry(capture)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.white)
+                    .foregroundStyle(.black)
+                    Button("Delete capture…", role: .destructive) {
+                        captureToDelete = capture
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(.white)
                 }
-                .buttonStyle(.borderedProminent)
-                .tint(.white)
-                .foregroundStyle(.black)
                 .padding(.top, 8)
             }
             .padding()
+            .foregroundStyle(.white)
         }
     }
 
+    // MARK: - Completed viewer
+
     private func completedViewer(
         url: URL,
-        capture: CaptureRecord
+        capture: CaptureRecord,
+        hasRawSplat: Bool
     ) -> some View {
         ZStack {
             SplatMetalView(
@@ -328,89 +480,214 @@ struct ContentView: View {
                 status: $viewerStatus,
                 resetToken: viewerResetToken,
                 autoRotate: viewerAutoRotate,
-                verticalAxis: viewerVerticalAxis
+                verticalAxis: viewerVerticalAxis,
+                customCleanFraction: viewMode == .custom
+                    ? Float(cleanAmount)
+                    : nil,
+                proxy: viewerProxy
             )
-                .ignoresSafeArea()
+            .ignoresSafeArea()
 
-            VStack {
-                HStack {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(capture.sourceFilename)
-                            .font(.headline)
-                        viewerStatusLabel
-                    }
-                    .foregroundStyle(.white)
-                    Spacer()
-                    if model.hasUnfilteredSplat(for: capture) {
-                        Picker(
-                            "Splat view",
-                            selection: Binding(
-                                get: { showUnfilteredSplat },
-                                set: { newValue in
-                                    guard newValue != showUnfilteredSplat else {
-                                        return
-                                    }
-                                    showUnfilteredSplat = newValue
-                                    viewerResetToken += 1
-                                }
-                            )
-                        ) {
-                            Text("Cleaned").tag(false)
-                            Text("Unfiltered").tag(true)
-                        }
-                        .pickerStyle(.segmented)
-                        .frame(maxWidth: 220)
-                        .labelsHidden()
-                        .help(
-                            "Cleaned is the isolated subject. Unfiltered is the raw training splat."
+            VStack(spacing: 10) {
+                viewerTopBar(capture, hasRawSplat: hasRawSplat)
+                if viewMode == .custom {
+                    cleanupSliderBar
+                        .transition(
+                            .move(edge: .top).combined(with: .opacity)
                         )
-                    }
-                    Button {
-                        presentSavePanel(
-                            suggestedName: showUnfilteredSplat
-                                ? "splat.ply"
-                                : "scene-hq.ply",
-                            copying: url
-                        )
-                    } label: {
-                        Label("Export PLY", systemImage: "square.and.arrow.up")
-                    }
-                    .buttonStyle(.bordered)
-                    .tint(.white)
-                    if let meshURL = model.meshURL(for: capture) {
-                        Button {
-                            presentSavePanel(
-                                suggestedName: "mesh.usdz",
-                                copying: meshURL
-                            )
-                        } label: {
-                            Label("Export USDZ", systemImage: "cube")
-                        }
-                        .buttonStyle(.bordered)
-                        .tint(.white)
-                    }
-                    Button {
-                        isImportingVideo = true
-                    } label: {
-                        Label("New capture", systemImage: "plus")
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(.white)
-                    .foregroundStyle(.black)
                 }
-                .padding(12)
-                .background(
-                    .black.opacity(0.58),
-                    in: RoundedRectangle(cornerRadius: 15)
-                )
-
                 Spacer()
-
-                viewerControls
+                if let progress = videoExportProgress {
+                    exportProgressCard(progress)
+                        .transition(.opacity)
+                }
+                viewerControls(capture)
             }
-            .padding(20)
+            .padding(16)
+            .animation(.easeOut(duration: 0.22), value: viewMode)
+            .animation(
+                .easeOut(duration: 0.2),
+                value: videoExportProgress == nil
+            )
+        }
+        .task(id: capture.id) {
+            audio.prepare(videoURL: model.sourceVideoURL(for: capture))
         }
     }
+
+    private func viewerTopBar(
+        _ capture: CaptureRecord,
+        hasRawSplat: Bool
+    ) -> some View {
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(capture.sourceFilename)
+                    .font(.headline)
+                    .lineLimit(1)
+                viewerStatusLabel
+                    .font(.caption)
+            }
+            .foregroundStyle(.white)
+
+            Spacer()
+
+            if hasRawSplat {
+                Picker("Splat view", selection: $viewMode) {
+                    Text("Cleaned").tag(SplatViewMode.cleaned)
+                    Text("Custom").tag(SplatViewMode.custom)
+                    Text("Unfiltered").tag(SplatViewMode.unfiltered)
+                }
+                .pickerStyle(.segmented)
+                .frame(maxWidth: 280)
+                .labelsHidden()
+                .help(
+                    "Cleaned is the isolated subject. Unfiltered is the raw "
+                        + "training splat. Custom cleans live as you drag."
+                )
+                .onChange(of: viewMode) { _, _ in
+                    viewerResetToken += 1
+                }
+            }
+
+            Menu {
+                Button("Image (PNG)…") {
+                    exportImage(capture)
+                }
+                Button("Orbit Video (MP4)…") {
+                    exportOrbitVideo(capture)
+                }
+                Divider()
+                Button("Splat (PLY)…") {
+                    presentSavePanel(
+                        suggestedName: viewMode == .cleaned
+                            ? "scene-hq.ply"
+                            : "splat.ply",
+                        copying: model.splatURL(
+                            for: capture,
+                            unfiltered: viewMode != .cleaned
+                        ) ?? model.splatURL(for: capture)
+                    )
+                }
+                if let meshURL = model.meshURL(for: capture) {
+                    Button("Mesh (USDZ)…") {
+                        presentSavePanel(
+                            suggestedName: "mesh.usdz",
+                            copying: meshURL
+                        )
+                    }
+                }
+            } label: {
+                Label("Export", systemImage: "square.and.arrow.up")
+            }
+            .menuStyle(.borderedButton)
+            .fixedSize()
+            .disabled(videoExportProgress != nil)
+            .tint(.white)
+
+            Button {
+                isShowingTips = true
+            } label: {
+                Image(systemName: "questionmark.circle")
+            }
+            .buttonStyle(.bordered)
+            .tint(.white)
+            .help("What kinds of videos work best")
+            .popover(isPresented: $isShowingTips) {
+                CaptureTipsView()
+            }
+
+            Button {
+                isImportingVideo = true
+            } label: {
+                Label("New capture", systemImage: "plus")
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.white)
+            .foregroundStyle(.black)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 11)
+        .background(
+            .black.opacity(0.58),
+            in: RoundedRectangle(cornerRadius: 14, style: .continuous)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(.white.opacity(0.08), lineWidth: 1)
+        )
+        .shadow(color: .black.opacity(0.3), radius: 14, y: 6)
+    }
+
+    /// Revealed under the top bar in Custom mode: scrubs from the raw scene
+    /// (left) to a tightly isolated core (right), rebuilding the splat live.
+    private var cleanupSliderBar: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "sparkles")
+                .foregroundStyle(.white.opacity(0.7))
+                .font(.system(size: 12))
+            Text("RAW")
+                .font(.system(size: 9, weight: .bold, design: .monospaced))
+                .tracking(1.5)
+                .foregroundStyle(.white.opacity(0.5))
+            Slider(value: $cleanAmount, in: 0...1)
+                .controlSize(.small)
+                .tint(.white)
+            Text("CLEAN")
+                .font(.system(size: 9, weight: .bold, design: .monospaced))
+                .tracking(1.5)
+                .foregroundStyle(.white.opacity(0.5))
+            if case let .ready(pointCount) = viewerStatus {
+                Text("\(pointCount.formatted()) kept")
+                    .font(.system(size: 11, design: .monospaced))
+                    .monospacedDigit()
+                    .foregroundStyle(.white.opacity(0.65))
+                    .frame(width: 110, alignment: .trailing)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(
+            .black.opacity(0.58),
+            in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(.white.opacity(0.08), lineWidth: 1)
+        )
+        .frame(maxWidth: 560)
+    }
+
+    private func exportProgressCard(_ progress: Double) -> some View {
+        HStack(spacing: 12) {
+            ProgressView(value: progress)
+                .progressViewStyle(.linear)
+                .tint(.white)
+                .frame(width: 220)
+            Text("Rendering orbit \(Int((progress * 100).rounded()))%")
+                .font(.system(size: 11, design: .monospaced))
+                .monospacedDigit()
+                .foregroundStyle(.white.opacity(0.7))
+            Button("Cancel", role: .cancel) {
+                videoExportTask?.cancel()
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .tint(.white)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(
+            .black.opacity(0.65),
+            in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(.white.opacity(0.08), lineWidth: 1)
+        )
+        .shadow(color: .black.opacity(0.3), radius: 14, y: 6)
+    }
+
+    // MARK: - Standalone viewer
 
     private func standaloneViewer(
         _ url: URL,
@@ -422,17 +699,26 @@ struct ContentView: View {
                 status: $viewerStatus,
                 resetToken: viewerResetToken,
                 autoRotate: viewerAutoRotate,
-                verticalAxis: isSample ? .yUp : viewerVerticalAxis
+                verticalAxis: isSample ? .yUp : viewerVerticalAxis,
+                proxy: viewerProxy
             )
                 .ignoresSafeArea()
             VStack {
                 HStack {
-                    VStack(alignment: .leading, spacing: 3) {
+                    VStack(alignment: .leading, spacing: 2) {
                         Text(isSample ? "Sample splat" : url.lastPathComponent)
                             .font(.headline)
                         viewerStatusLabel
+                            .font(.caption)
                     }
                     Spacer()
+                    Button {
+                        exportImage(nil)
+                    } label: {
+                        Label("Image", systemImage: "camera")
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(.white)
                     if isSample {
                         Button("Back") {
                             model.standaloneSampleURL = nil
@@ -443,19 +729,111 @@ struct ContentView: View {
                     }
                 }
                 .foregroundStyle(.white)
-                .padding(13)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 11)
                 .background(
                     .black.opacity(0.58),
-                    in: RoundedRectangle(cornerRadius: 15)
+                    in: RoundedRectangle(cornerRadius: 14, style: .continuous)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .stroke(.white.opacity(0.08), lineWidth: 1)
                 )
                 Spacer()
-                viewerControls
+                viewerControls(nil)
             }
-            .padding(20)
+            .padding(16)
         }
     }
 
-    private func presentSavePanel(suggestedName: String, copying source: URL) {
+    // MARK: - Exports
+
+    private func exportImage(_ capture: CaptureRecord?) {
+        let baseName = capture.map {
+            ($0.sourceFilename as NSString).deletingPathExtension
+        } ?? "splat"
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.png]
+        panel.nameFieldStringValue = "\(baseName).png"
+        panel.canCreateDirectories = true
+        panel.begin { response in
+            guard response == .OK, let destination = panel.url else {
+                return
+            }
+            Task { @MainActor in
+                do {
+                    guard let renderer = viewerProxy.renderer,
+                          renderer.isSceneLoaded else {
+                        throw ExportError.sceneNotLoaded
+                    }
+                    let image = try await renderer.snapshotImage()
+                    guard let imageDestination =
+                        CGImageDestinationCreateWithURL(
+                            destination as CFURL,
+                            UTType.png.identifier as CFString,
+                            1,
+                            nil
+                        )
+                    else {
+                        throw ExportError.imageEncodingFailed
+                    }
+                    CGImageDestinationAddImage(imageDestination, image, nil)
+                    guard CGImageDestinationFinalize(imageDestination) else {
+                        throw ExportError.imageEncodingFailed
+                    }
+                    NSWorkspace.shared
+                        .activateFileViewerSelecting([destination])
+                } catch {
+                    model.alertMessage = error.localizedDescription
+                }
+            }
+        }
+    }
+
+    private func exportOrbitVideo(_ capture: CaptureRecord) {
+        let baseName = (capture.sourceFilename as NSString)
+            .deletingPathExtension
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.mpeg4Movie]
+        panel.nameFieldStringValue = "\(baseName)-orbit.mp4"
+        panel.canCreateDirectories = true
+        panel.begin { response in
+            guard response == .OK, let destination = panel.url else {
+                return
+            }
+            videoExportTask = Task { @MainActor in
+                videoExportProgress = 0
+                defer {
+                    videoExportProgress = nil
+                    videoExportTask = nil
+                }
+                do {
+                    guard let renderer = viewerProxy.renderer,
+                          renderer.isSceneLoaded else {
+                        throw ExportError.sceneNotLoaded
+                    }
+                    try await renderer.exportOrbitVideo(
+                        to: destination,
+                        progress: { videoExportProgress = $0 }
+                    )
+                    NSSound(named: "Glass")?.play()
+                    NSWorkspace.shared
+                        .activateFileViewerSelecting([destination])
+                } catch is CancellationError {
+                    try? FileManager.default.removeItem(at: destination)
+                } catch {
+                    try? FileManager.default.removeItem(at: destination)
+                    model.alertMessage = error.localizedDescription
+                }
+            }
+        }
+    }
+
+    private func presentSavePanel(suggestedName: String, copying source: URL?) {
+        guard let source else {
+            model.alertMessage = "Nothing is available to export."
+            return
+        }
         let panel = NSSavePanel()
         panel.nameFieldStringValue = suggestedName
         panel.canCreateDirectories = true
@@ -474,7 +852,9 @@ struct ContentView: View {
         }
     }
 
-    private var viewerControls: some View {
+    // MARK: - Viewer chrome
+
+    private func viewerControls(_ capture: CaptureRecord?) -> some View {
         HStack(spacing: 10) {
             Button {
                 viewerResetToken += 1
@@ -500,6 +880,34 @@ struct ContentView: View {
                     systemImage: "arrow.up.and.down"
                 )
             }
+
+            if capture != nil {
+                Divider()
+                    .frame(height: 16)
+                Button {
+                    withAnimation(.easeOut(duration: 0.2)) {
+                        audio.isPlaying.toggle()
+                    }
+                } label: {
+                    Label(
+                        audio.isPlaying ? "Sound On" : "Sound",
+                        systemImage: audio.isPlaying
+                            ? "speaker.wave.2.fill"
+                            : "speaker.slash"
+                    )
+                }
+                .help("Loop the capture's original soundtrack")
+                if audio.isPlaying {
+                    Slider(value: $audio.volume, in: 0...1)
+                        .controlSize(.mini)
+                        .tint(.white)
+                        .frame(width: 84)
+                        .transition(
+                            .move(edge: .leading).combined(with: .opacity)
+                        )
+                }
+            }
+
             Text("LEFT DRAG ORBITS · RIGHT DRAG PANS · SCROLL ZOOMS · R RESETS")
                 .font(.system(
                     size: 9,
@@ -508,6 +916,7 @@ struct ContentView: View {
                 ))
                 .tracking(0.8)
                 .foregroundStyle(.white.opacity(0.72))
+                .padding(.leading, 4)
         }
         .buttonStyle(.bordered)
         .tint(.white)
@@ -515,6 +924,10 @@ struct ContentView: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 9)
         .background(.black.opacity(0.55), in: Capsule())
+        .overlay(
+            Capsule().stroke(.white.opacity(0.08), lineWidth: 1)
+        )
+        .shadow(color: .black.opacity(0.3), radius: 14, y: 6)
     }
 
     @ViewBuilder
@@ -522,14 +935,17 @@ struct ContentView: View {
         switch viewerStatus {
         case .idle:
             Text("Ready")
+                .foregroundStyle(.secondary)
         case .loading:
             HStack(spacing: 6) {
                 ProgressView()
                     .controlSize(.small)
                 Text("Loading…")
             }
+            .foregroundStyle(.secondary)
         case let .ready(pointCount):
             Text("\(pointCount.formatted()) Gaussians")
+                .monospacedDigit()
                 .foregroundStyle(.secondary)
         case let .failed(message):
             Text(message)
@@ -597,9 +1013,16 @@ private struct CaptureRow: View {
                 Text(capture.sourceFilename)
                     .font(.callout.weight(.medium))
                     .lineLimit(1)
-                Text(capture.state.displayName)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                Text(
+                    capture.state.displayName
+                        + " · "
+                        + capture.createdAt.formatted(
+                            .relative(presentation: .named)
+                        )
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
             }
             Spacer()
         }
@@ -621,13 +1044,13 @@ private struct StageRail: View {
     var body: some View {
         HStack(spacing: 8) {
             ForEach(Array(stages.enumerated()), id: \.offset) { index, entry in
-                VStack(spacing: 8) {
+                VStack(spacing: 6) {
                     Circle()
                         .fill(color(for: entry.0))
-                        .frame(width: 9, height: 9)
+                        .frame(width: 7, height: 7)
                     Text(entry.1)
                         .font(.system(
-                            size: 9,
+                            size: 8,
                             weight: .medium,
                             design: .monospaced
                         ))

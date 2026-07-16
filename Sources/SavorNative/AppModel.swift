@@ -1,3 +1,4 @@
+import AppKit
 import Combine
 import Foundation
 import SplatEngine
@@ -68,6 +69,26 @@ final class AppModel: ObservableObject {
         pipelineTask?.cancel()
     }
 
+    /// Removes the capture and everything on disk under its workspace.
+    /// The running capture must be cancelled first.
+    func deleteCapture(_ record: CaptureRecord) {
+        guard runningCaptureID != record.id else {
+            alertMessage = "Cancel this capture before deleting it."
+            return
+        }
+        Task {
+            do {
+                try await repository.delete(record.id)
+                captures.removeAll { $0.id == record.id }
+                if selectedCaptureID == record.id {
+                    selectedCaptureID = captures.first?.id
+                }
+            } catch {
+                alertMessage = error.localizedDescription
+            }
+        }
+    }
+
     func splatURL(
         for record: CaptureRecord,
         unfiltered: Bool = false
@@ -87,6 +108,10 @@ final class AppModel: ObservableObject {
 
     func hasUnfilteredSplat(for record: CaptureRecord) -> Bool {
         splatURL(for: record, unfiltered: true) != nil
+    }
+
+    func sourceVideoURL(for record: CaptureRecord) -> URL {
+        repository.sourceVideoURL(for: record)
     }
 
     func meshURL(for record: CaptureRecord) -> URL? {
@@ -200,6 +225,7 @@ final class AppModel: ObservableObject {
                 cleaning: CaptureCleaningSummary(result.cleaning)
             )
             replace(completed)
+            NSSound(named: "Glass")?.play()
         } catch is CancellationError {
             if let record {
                 await transitionAfterFailure(
@@ -229,24 +255,69 @@ final class AppModel: ObservableObject {
         admission.release()
     }
 
+    /// Keeps `instantPreviewURL` pointed at the best preview available while
+    /// the pipeline runs: first the SHARP single-image preview, then each
+    /// msplat training checkpoint as it lands — so the processing screen
+    /// shows the actual splat refining live.
     private func startPreviewPolling(workspaceURL: URL, captureID: UUID) {
         previewPollTask?.cancel()
-        let previewPath = workspaceURL
+        let sharpURL = workspaceURL
             .appendingPathComponent("output/sharp-preview.ply")
+        let trainingURL = workspaceURL
+            .appendingPathComponent("training", isDirectory: true)
         previewPollTask = Task { [weak self] in
+            // A checkpoint is published only after its size holds steady
+            // across two polls, so a half-written PLY is never loaded.
+            var pendingURL: URL?
+            var pendingSize: Int64 = -1
             while !Task.isCancelled {
-                if FileManager.default.fileExists(atPath: previewPath.path) {
-                    await MainActor.run {
-                        guard self?.runningCaptureID == captureID else {
+                let candidate = Self.newestCheckpointPLY(in: trainingURL)
+                    ?? (FileManager.default.fileExists(atPath: sharpURL.path)
+                        ? sharpURL
+                        : nil)
+                if let candidate {
+                    let size = (try? FileManager.default
+                        .attributesOfItem(atPath: candidate.path)[.size]
+                        as? Int64) ?? -1
+                    if candidate == pendingURL, size == pendingSize, size > 0 {
+                        guard let self, self.runningCaptureID == captureID
+                        else {
                             return
                         }
-                        self?.instantPreviewURL = previewPath
+                        if self.instantPreviewURL != candidate {
+                            self.instantPreviewURL = candidate
+                        }
                     }
-                    return
+                    pendingURL = candidate
+                    pendingSize = size
                 }
-                try? await Task.sleep(for: .milliseconds(500))
+                try? await Task.sleep(for: .seconds(1))
             }
         }
+    }
+
+    /// Newest `splat_<step>.ply` checkpoint the trainer has exported.
+    private static func newestCheckpointPLY(in trainingURL: URL) -> URL? {
+        guard let names = try? FileManager.default.contentsOfDirectory(
+            atPath: trainingURL.path
+        ) else {
+            return nil
+        }
+        let best = names.compactMap { name -> (step: Int, name: String)? in
+            guard name.hasPrefix("splat_"), name.hasSuffix(".ply") else {
+                return nil
+            }
+            let digits = name.dropFirst("splat_".count).dropLast(".ply".count)
+            guard let step = Int(digits) else {
+                return nil
+            }
+            return (step, name)
+        }
+        .max { $0.step < $1.step }
+        guard let best else {
+            return nil
+        }
+        return trainingURL.appendingPathComponent(best.name)
     }
 
     private func receive(

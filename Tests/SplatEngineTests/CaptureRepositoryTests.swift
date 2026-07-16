@@ -33,6 +33,31 @@ final class CaptureRepositoryTests: XCTestCase {
         XCTAssertEqual(loaded, [record])
     }
 
+    func testDeleteRemovesWorkspaceAndIsIdempotent() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let source = root.appendingPathComponent("source.mov")
+        let captures = root.appendingPathComponent("captures", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: true
+        )
+        try Data("video".utf8).write(to: source)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let repository = CaptureRepository(rootURL: captures)
+        let record = try await repository.createCapture(from: source)
+        let workspace = repository.workspaceURL(for: record.id)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: workspace.path))
+
+        try await repository.delete(record.id)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: workspace.path))
+        let loaded = try await repository.loadAll()
+        XCTAssertTrue(loaded.isEmpty)
+        // Deleting again is a no-op, not an error.
+        try await repository.delete(record.id)
+    }
+
     func testMarksInFlightCaptureInterruptedWhenRelaunched() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
