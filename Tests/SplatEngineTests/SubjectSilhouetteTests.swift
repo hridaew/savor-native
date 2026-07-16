@@ -136,6 +136,89 @@ final class SubjectSilhouetteTests: XCTestCase {
         )
     }
 
+    /// The IMG_0899/IMG_9033 regression: an object capture with so much
+    /// reconstructed environment that the mass-median radius lands beyond
+    /// the camera orbit — the mass-ratio test alone calls it a room and
+    /// skips cleanup entirely. Vision finding one consistent subject across
+    /// the ring must veto that and clean normally.
+    func testConsistentSilhouettesVetoEnvironmentMisclassification() throws {
+        var points = makeDenseBlob(center: .zero, half: 2)
+        let subjectCount = points.count
+        // Environment mass just beyond the orbit — heavy enough to pull the
+        // mass median outside the camera ring. Wide-FOV views (fl 80 over a
+        // 200 px image ≈ 100°, like a phone) keep it in-frame from the far
+        // side of the ring, as in a real capture.
+        for shellCenter in [
+            SIMD3<Float>(1.35, 0, 0),
+            SIMD3<Float>(-1.3, 0.2, 0.3),
+            SIMD3<Float>(0, 0.1, 1.35),
+        ] {
+            points += makeDenseBlob(center: shellCenter, half: 3)
+        }
+        let cameras = ring(radius: 1.1)
+        let silhouettes = SubjectSilhouettes(views: cameras.map { eye in
+            silhouetteView(
+                eye: eye,
+                subjectPoints: Array(points.prefix(subjectCount)),
+                focalLength: 80
+            )
+        })
+
+        let output = try SplatCleaner.cleanPoints(
+            points.map(makePoint),
+            cameraCenters: cameras,
+            silhouettes: silhouettes,
+            configuration: SplatCleaningConfiguration(maskMinimumViews: 4)
+        )
+
+        XCTAssertFalse(
+            output.statistics.isEnvironment,
+            "A consistent subject across the ring is an object capture."
+        )
+        XCTAssertGreaterThan(output.statistics.subjectIsolatedCount, 0)
+        // The far environment shells are gone; the subject survives.
+        XCTAssertLessThanOrEqual(output.points.count, subjectCount)
+        XCTAssertGreaterThan(
+            output.points.count,
+            Int(Double(subjectCount) * 0.9)
+        )
+    }
+
+    /// The same environment-heavy geometry with masks that never agree
+    /// (Vision found no consistent subject) must keep the room verdict —
+    /// rooms are not carved down to one piece of furniture.
+    func testInconsistentSilhouettesLeaveEnvironmentVerdict() throws {
+        var points = makeDenseBlob(center: .zero, half: 2)
+        for shellCenter in [
+            SIMD3<Float>(3, 0, 0),
+            SIMD3<Float>(-3, 0.4, 0.5),
+            SIMD3<Float>(0, 0.2, 3),
+        ] {
+            points += makeDenseBlob(center: shellCenter, half: 3)
+        }
+        let cameras = ring(radius: 1.1)
+        let silhouettes = SubjectSilhouettes(views: cameras.map { eye in
+            makeView(
+                cameraToWorld: lookAt(eye: eye, target: .zero),
+                mask: [Bool](repeating: false, count: 200 * 200)
+            )
+        })
+
+        let output = try SplatCleaner.cleanPoints(
+            points.map(makePoint),
+            cameraCenters: cameras,
+            silhouettes: silhouettes,
+            configuration: SplatCleaningConfiguration(maskMinimumViews: 4)
+        )
+
+        XCTAssertTrue(output.statistics.isEnvironment)
+        XCTAssertEqual(output.statistics.subjectIsolatedCount, 0)
+        XCTAssertGreaterThan(
+            output.points.count,
+            Int(Double(points.count) * 0.9)
+        )
+    }
+
     // MARK: - Helpers
 
     /// A silhouette view whose mask is exactly the projection of the given
@@ -143,11 +226,13 @@ final class SubjectSilhouetteTests: XCTestCase {
     /// mask.
     private func silhouetteView(
         eye: SIMD3<Float>,
-        subjectPoints: [SIMD3<Float>]
+        subjectPoints: [SIMD3<Float>],
+        focalLength: Float = 300
     ) -> SubjectSilhouettes.View {
         let allTrue = makeView(
             cameraToWorld: lookAt(eye: eye, target: .zero),
-            mask: [Bool](repeating: true, count: 200 * 200)
+            mask: [Bool](repeating: true, count: 200 * 200),
+            focalLength: focalLength
         )
         var mask = [Bool](repeating: false, count: 200 * 200)
         for point in subjectPoints {
@@ -158,18 +243,20 @@ final class SubjectSilhouetteTests: XCTestCase {
         mask = SubjectMaskGenerator.dilated(mask, width: 200, height: 200)
         return makeView(
             cameraToWorld: lookAt(eye: eye, target: .zero),
-            mask: mask
+            mask: mask,
+            focalLength: focalLength
         )
     }
 
     private func makeView(
         cameraToWorld: simd_float4x4,
-        mask: [Bool]
+        mask: [Bool],
+        focalLength: Float = 300
     ) -> SubjectSilhouettes.View {
         SubjectSilhouettes.View(
             worldToCamera: cameraToWorld.inverse,
-            focalLengthX: 300,
-            focalLengthY: 300,
+            focalLengthX: focalLength,
+            focalLengthY: focalLength,
             principalPointX: 100,
             principalPointY: 100,
             imageWidth: 200,

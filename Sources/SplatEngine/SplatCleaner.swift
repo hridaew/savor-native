@@ -35,8 +35,9 @@ public struct SplatCleaningConfiguration: Sendable, Equatable {
     /// that see it. True subject points score ~1 (silhouette property);
     /// attached environment and near-surface fog score low from side views.
     public var maskConsensusThreshold: Float
-    /// A splat must be seen by at least this many mask views for the
-    /// consensus to count; fewer and it falls through to geometric passes.
+    /// A splat must be inside at least this many mask views' frusta to
+    /// qualify as subject at all — the subject is visible from the whole
+    /// ring by construction, so underseen splats are environment.
     public var maskMinimumViews: Int
     /// Retained for API/config compatibility; unused by the connected-component
     /// isolation that replaced the old radial density crop.
@@ -402,8 +403,59 @@ public enum SplatCleaner {
                 break
             }
         }
-        let isEnvironment = rawOrbitRadius > 0
+        // Mass-ratio guess: cameras sitting inside the scene's own opacity
+        // mass reads as an inside-out room capture. It is a knife-edge for
+        // object captures with heavy environment reconstruction — when ~half
+        // the mass is environment beyond the orbit, run-to-run trainer
+        // variance flips this bit and cleanup silently no-ops.
+        let massEnvironment = rawOrbitRadius > 0
             && rawOrbitRadius < 1.05 * massRadius
+
+        // Silhouette consensus (visual hull): a splat survives only if it
+        // lands on Vision's subject silhouette in enough of the views that
+        // see it. Computed before the environment decision because it IS
+        // evidence for it: Vision finding one consistent subject across the
+        // whole camera ring (the hull keeps a sane fraction) means the user
+        // filmed a thing, however much room got reconstructed around it — it
+        // vetoes the mass-ratio guess. A genuine room produces inconsistent
+        // per-frame foregrounds, the hull keeps almost nothing, and the
+        // verdict stands.
+        // The subject is, by construction, the one thing visible from the
+        // whole ring — so a splat is subject only when enough views see it
+        // AND it lands on the silhouette in nearly all of them. Underseen
+        // splats (walls behind the camera for half the orbit, narrow-FOV
+        // margins) are environment by that same construction.
+        var isOutsideHull = [Bool](repeating: false, count: count)
+        var hullExcludedCount = 0
+        var hullIsConsistentSubject = false
+        if let silhouettes, configuration.isolateSubject {
+            var candidateCount = 0
+            var coreCount = 0
+            var outside = [Bool](repeating: false, count: count)
+            for index in points.indices where !isFloater[index] {
+                candidateCount += 1
+                let verdict = silhouettes.consensus(for: positions[index])
+                if verdict.seenBy >= configuration.maskMinimumViews,
+                   verdict.ratio >= configuration.maskConsensusThreshold {
+                    coreCount += 1
+                } else {
+                    outside[index] = true
+                }
+            }
+            // A coherent 3D body reprojecting into the masks from all around
+            // the ring (≥2% of the cloud) means the user filmed a thing —
+            // random per-frame foregrounds (a room) never agree in 3D. It
+            // also vetoes the mass-ratio environment guess above. Below 2%
+            // the masks missed the subject; applying them would hollow the
+            // capture out, so they are discarded entirely.
+            hullIsConsistentSubject = candidateCount > 0
+                && Float(coreCount) / Float(candidateCount) >= 0.02
+            if hullIsConsistentSubject {
+                isOutsideHull = outside
+                hullExcludedCount = candidateCount - coreCount
+            }
+        }
+        let isEnvironment = massEnvironment && !hullIsConsistentSubject
 
         let hazeInnerRadius: Float
         let hazeOuterRadius: Float
@@ -460,37 +512,6 @@ public enum SplatCleaner {
                     isHaze[index] = true
                     hazeRemovedCount += 1
                 }
-            }
-        }
-
-        // Silhouette consensus (visual hull): when Vision subject masks are
-        // available, a splat survives only if it lands on the subject's
-        // silhouette in enough of the views that see it. This is what
-        // separates attached environment — pedestal edges, floor shadows,
-        // "spilled milk" fog hovering just off the surface — from the
-        // subject: they touch it in 3D, but fall outside its silhouette
-        // from side views. Geometry alone cannot make that distinction.
-        var isOutsideHull = [Bool](repeating: false, count: count)
-        var hullExcludedCount = 0
-        if let silhouettes,
-           configuration.isolateSubject,
-           !isEnvironment {
-            var postHazeCount = 0
-            for index in points.indices
-            where !isFloater[index] && !isHaze[index] {
-                postHazeCount += 1
-                let verdict = silhouettes.consensus(for: positions[index])
-                if verdict.seenBy >= configuration.maskMinimumViews,
-                   verdict.ratio < configuration.maskConsensusThreshold {
-                    isOutsideHull[index] = true
-                    hullExcludedCount += 1
-                }
-            }
-            // Bad masks (subject missed in most frames) would hollow the
-            // scene out — discard the hull rather than ship near-nothing.
-            if postHazeCount - hullExcludedCount < postHazeCount / 50 {
-                isOutsideHull = [Bool](repeating: false, count: count)
-                hullExcludedCount = 0
             }
         }
 

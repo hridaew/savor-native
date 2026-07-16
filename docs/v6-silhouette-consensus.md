@@ -1,7 +1,10 @@
 # v6 — silhouette-consensus cleanup (visual hull via Vision)
 
-Status 2026-07-16: **shipped.** Full suite green (89 tests). Validated on
-the real IMG_0887 capture end to end.
+Status 2026-07-16: **shipped, then repaired same day.** The first cut was
+validated on a single capture (IMG_0887) and regressed two others to zero
+cleanup — see "The incident" below. The repaired version is verified across
+every capture on disk via `scripts/verify-cleanup.sh`, which is now the
+required pre-commit check for cleaner changes.
 
 ## The problem geometry could not solve
 
@@ -84,6 +87,41 @@ ported; the Swift port reproduces the prototype's numbers.
 - `testHullFallsBackWhenMasksMissEverything` — bad masks never hollow out
   a capture.
 - `testDilationExpandsMaskByOnePixel`.
+
+## The incident, and what it changed
+
+The first v6 gated the hull on the existing `isEnvironment` flag. That flag
+is a knife-edge: it compares the camera-orbit radius against the median-mass
+radius, and object captures that reconstruct ~half their mass as environment
+(KAWS, IMG_9033) flip to "environment" on trainer variance — which then
+skips haze, hull, *and* isolation. Cleaned mode shipped the raw scene.
+
+Three repairs, each verified against all four captures on disk:
+
+1. **Consistent silhouettes veto the environment guess.** If ≥2% of the
+   cloud reprojects into the masks from ≥8 views (a coherent 3D body —
+   random per-frame foregrounds in a room never agree in 3D), the capture
+   is an object capture, whatever the mass ratio says.
+2. **Underseen splats are environment.** The subject is in-frame from the
+   whole ring by construction; anything inside fewer than 8 view frusta is
+   not the subject. The first Swift port had silently deviated from the
+   validated Python prototype here (the prototype required
+   `seen >= 8 && ratio >= threshold` to keep) — restoring it is what
+   carved the IMG_9033 room out (297k → 70k kept).
+3. **Centered-instance masks.** Vision's `allInstances` can bundle a
+   pedestal with the subject; the instance under the image center (the
+   capture instruction is "keep the object centered") is preferred, with
+   all-instances as the fallback. (On captures where Vision sees subject +
+   pedestal as *one* instance, the pedestal is kept — a known limit.)
+
+Verification (all four captures, `scripts/verify-cleanup.sh`):
+
+| Capture | Raw | Kept | Verdict |
+|---|---|---|---|
+| hand re-run | 169,644 | 63,393 | isolated, all fingers |
+| IMG_0887 (hand, gallery) | 153,375 | 63,166 | isolated, all fingers |
+| IMG_9033 (bottle, home) | 296,681 | 70,515 | bottle + its roller pedestal (one Vision instance); room gone — was **zero cleanup** |
+| IMG_0899 (KAWS, gallery) | 819,154 | 335,611 | isolated, intact — was **zero cleanup** |
 
 ## Follow-ups
 

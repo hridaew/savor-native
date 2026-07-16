@@ -71,12 +71,20 @@ public enum SubjectMaskGenerator {
         }
         guard
             let observation = request.results?.first,
-            !observation.allInstances.isEmpty,
-            let maskBuffer = try? observation.generateScaledMaskForImage(
-                forInstances: observation.allInstances,
-                from: handler
-            )
+            !observation.allInstances.isEmpty
         else {
+            return nil
+        }
+        // Capture UX says "keep the object centered", so the instance under
+        // the image center IS the subject. Vision's allInstances often
+        // bundles the pedestal/stand under it as a second instance — a fat
+        // silhouette that lets the environment behind it survive consensus.
+        let instances = centeredInstance(of: observation)
+            ?? observation.allInstances
+        guard let maskBuffer = try? observation.generateScaledMaskForImage(
+            forInstances: instances,
+            from: handler
+        ) else {
             return nil
         }
         guard var bitmap = downsampledBitmap(from: maskBuffer) else {
@@ -106,6 +114,46 @@ public enum SubjectMaskGenerator {
             maskWidth: bitmap.width,
             maskHeight: bitmap.height
         )
+    }
+
+    /// The foreground instance covering the image's central region, probed
+    /// at the center and four nearby points (most frequent non-background
+    /// label wins). Nil when the center is background — the caller then
+    /// keeps every instance rather than guessing.
+    private static func centeredInstance(
+        of observation: VNInstanceMaskObservation
+    ) -> IndexSet? {
+        let labels = observation.instanceMask
+        CVPixelBufferLockBaseAddress(labels, .readOnly)
+        defer {
+            CVPixelBufferUnlockBaseAddress(labels, .readOnly)
+        }
+        guard let base = CVPixelBufferGetBaseAddress(labels) else {
+            return nil
+        }
+        let width = CVPixelBufferGetWidth(labels)
+        let height = CVPixelBufferGetHeight(labels)
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(labels)
+        guard width > 0, height > 0 else {
+            return nil
+        }
+        var votes: [UInt8: Int] = [:]
+        for (offsetX, offsetY) in [
+            (0.5, 0.5), (0.5, 0.4), (0.5, 0.6), (0.42, 0.5), (0.58, 0.5),
+        ] {
+            let x = min(width - 1, Int(Double(width) * offsetX))
+            let y = min(height - 1, Int(Double(height) * offsetY))
+            let label = (base + y * bytesPerRow)
+                .load(fromByteOffset: x, as: UInt8.self)
+            if label != 0 {
+                votes[label, default: 0] += 1
+            }
+        }
+        guard let winner = votes.max(by: { $0.value < $1.value })?.key
+        else {
+            return nil
+        }
+        return IndexSet(integer: Int(winner))
     }
 
     /// Max-pools the Vision mask down to the working resolution — block max
