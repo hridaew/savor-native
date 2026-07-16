@@ -321,7 +321,11 @@ final class AppModel: ObservableObject {
                 let result = try await NativeSplatPostprocessor().process(
                     inputURL: checkpoint,
                     outputURL: sceneURL,
-                    cameraCenters: cameraCenters
+                    cameraCenters: cameraCenters,
+                    datasetURL: workspace.appendingPathComponent(
+                        "dataset",
+                        isDirectory: true
+                    )
                 )
                 let completed = try await repository.transition(
                     id,

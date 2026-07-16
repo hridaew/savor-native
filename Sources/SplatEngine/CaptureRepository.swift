@@ -321,6 +321,10 @@ public actor CaptureRepository {
                     outputURL: outputURL,
                     cameraCenters: Self.loadCameraCenters(
                         from: workspaceURL
+                    ),
+                    datasetURL: workspaceURL.appendingPathComponent(
+                        "dataset",
+                        isDirectory: true
                     )
                 )
                 _ = try transition(

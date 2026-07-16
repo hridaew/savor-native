@@ -29,10 +29,14 @@ flowchart LR
    splatting trainer written entirely in Metal compute shaders, optimizes
    ~15k steps on-device. Checkpoints stream into the app as they land, so
    you watch the scene sharpen live — and can stop early and keep it.
-4. **Cleanup** — a pure-Swift pass strips floaters and haze, then isolates
-   the filmed subject: everything outside the camera orbit is provably
-   environment, and a connected-component flood over the remaining mass
-   separates the object from the room without amputating thin parts.
+4. **Cleanup** — a Swift pass strips floaters and haze, then isolates the
+   filmed subject two ways at once: Vision's subject segmentation (the
+   "lift subject" model) turns every frame into a silhouette, and a splat
+   survives only if it lands inside the subject's outline from the cameras
+   that see it — the classical visual hull, which removes pedestals,
+   shadows, and hovering fog that geometry alone can't distinguish from
+   the subject. A connected-component flood then drops anything left at
+   the wrong depth, without amputating thin parts.
 5. **View + export** — MetalSplatter renders the result in an interactive
    viewer. Export the splat (PLY/USDZ), a PNG of any viewpoint, or a
    360° orbit video — with or without the capture's own soundtrack.

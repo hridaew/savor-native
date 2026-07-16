@@ -30,6 +30,14 @@ public struct SplatCleaningConfiguration: Sendable, Equatable {
     /// A voxel counts as subject surface when its summed alpha clears this
     /// fraction of the densest voxel's — filters sparse background voxels.
     public var subjectVoxelMassFloor: Float
+    /// Silhouette-consensus keep threshold: a splat survives when it lands
+    /// on the subject's Vision mask in at least this fraction of the views
+    /// that see it. True subject points score ~1 (silhouette property);
+    /// attached environment and near-surface fog score low from side views.
+    public var maskConsensusThreshold: Float
+    /// A splat must be seen by at least this many mask views for the
+    /// consensus to count; fewer and it falls through to geometric passes.
+    public var maskMinimumViews: Int
     /// Retained for API/config compatibility; unused by the connected-component
     /// isolation that replaced the old radial density crop.
     public var subjectKeepMultiplier: Float
@@ -53,6 +61,8 @@ public struct SplatCleaningConfiguration: Sendable, Equatable {
         subjectOrbitKeepFraction: Float = 0.95,
         subjectVoxelFactor: Float = 0.06,
         subjectVoxelMassFloor: Float = 0.03,
+        maskConsensusThreshold: Float = 0.8,
+        maskMinimumViews: Int = 8,
         subjectKeepMultiplier: Float = 1.08,
         orbitKeepFraction: Float = 0.75,
         densityPeakFraction: Float = 0.28,
@@ -73,6 +83,8 @@ public struct SplatCleaningConfiguration: Sendable, Equatable {
         self.subjectOrbitKeepFraction = subjectOrbitKeepFraction
         self.subjectVoxelFactor = subjectVoxelFactor
         self.subjectVoxelMassFloor = subjectVoxelMassFloor
+        self.maskConsensusThreshold = maskConsensusThreshold
+        self.maskMinimumViews = maskMinimumViews
         self.subjectKeepMultiplier = subjectKeepMultiplier
         self.orbitKeepFraction = orbitKeepFraction
         self.densityPeakFraction = densityPeakFraction
@@ -126,6 +138,7 @@ public enum SplatCleaner {
         inputURL: URL,
         outputURL: URL,
         cameraCenters: [SIMD3<Float>] = [],
+        silhouettes: SubjectSilhouettes? = nil,
         configuration: SplatCleaningConfiguration =
             SplatCleaningConfiguration()
     ) async throws -> SplatCleaningResult {
@@ -148,6 +161,7 @@ public enum SplatCleaner {
         let cleaned = try cleanPoints(
             points,
             cameraCenters: cameraCenters,
+            silhouettes: silhouettes,
             configuration: configuration
         )
 
@@ -186,6 +200,7 @@ public enum SplatCleaner {
     static func cleanPoints(
         _ points: [SplatPoint],
         cameraCenters: [SIMD3<Float>] = [],
+        silhouettes: SubjectSilhouettes? = nil,
         configuration: SplatCleaningConfiguration =
             SplatCleaningConfiguration()
     ) throws -> CleanedSplatPoints {
@@ -448,6 +463,37 @@ public enum SplatCleaner {
             }
         }
 
+        // Silhouette consensus (visual hull): when Vision subject masks are
+        // available, a splat survives only if it lands on the subject's
+        // silhouette in enough of the views that see it. This is what
+        // separates attached environment — pedestal edges, floor shadows,
+        // "spilled milk" fog hovering just off the surface — from the
+        // subject: they touch it in 3D, but fall outside its silhouette
+        // from side views. Geometry alone cannot make that distinction.
+        var isOutsideHull = [Bool](repeating: false, count: count)
+        var hullExcludedCount = 0
+        if let silhouettes,
+           configuration.isolateSubject,
+           !isEnvironment {
+            var postHazeCount = 0
+            for index in points.indices
+            where !isFloater[index] && !isHaze[index] {
+                postHazeCount += 1
+                let verdict = silhouettes.consensus(for: positions[index])
+                if verdict.seenBy >= configuration.maskMinimumViews,
+                   verdict.ratio < configuration.maskConsensusThreshold {
+                    isOutsideHull[index] = true
+                    hullExcludedCount += 1
+                }
+            }
+            // Bad masks (subject missed in most frames) would hollow the
+            // scene out — discard the hull rather than ship near-nothing.
+            if postHazeCount - hullExcludedCount < postHazeCount / 50 {
+                isOutsideHull = [Bool](repeating: false, count: count)
+                hullExcludedCount = 0
+            }
+        }
+
         // Subject isolation (object captures): keep the dense splat mass that
         // is connected to the subject and sits inside the camera orbit; drop
         // the environment. An orbit necessarily surrounds its subject, so
@@ -493,7 +539,9 @@ public enum SplatCleaner {
             var voxelHasAbove: [VoxelKey: Bool] = [:]
             var voxelColumn: [VoxelKey: Int64] = [:]
             var columnsWithBodyAbove = Set<Int64>()
-            for index in points.indices where !isFloater[index] && !isHaze[index] {
+            for index in points.indices
+            where !isFloater[index] && !isHaze[index]
+                && !isOutsideHull[index] {
                 postHazeCount += 1
                 guard simd_length(positions[index] - center) <= keepRadius else {
                     continue
@@ -594,7 +642,8 @@ public enum SplatCleaner {
                     component.formUnion(reclaimed)
                 }
                 for index in points.indices
-                where !isFloater[index] && !isHaze[index] {
+                where !isFloater[index] && !isHaze[index]
+                    && !isOutsideHull[index] {
                     let inside = simd_length(positions[index] - center) <= keepRadius
                         && component.contains(subjectKey(positions[index]))
                     if !inside {
@@ -616,7 +665,8 @@ public enum SplatCleaner {
         var keptIndices: [Int] = []
         keptIndices.reserveCapacity(count - floaterCount - hazeRemovedCount)
         for index in points.indices
-        where !isFloater[index] && !isHaze[index] && !isOutsideSubject[index] {
+        where !isFloater[index] && !isHaze[index]
+            && !isOutsideHull[index] && !isOutsideSubject[index] {
             keptIndices.append(index)
         }
         if keptIndices.isEmpty {
@@ -626,6 +676,7 @@ public enum SplatCleaner {
                 isOutsideSubject[index] = false
             }
             subjectIsolatedCount = 0
+            hullExcludedCount = 0
         }
 
         let keptDistances = keptIndices
@@ -682,7 +733,7 @@ public enum SplatCleaner {
                 keptCount: cleanedPoints.count,
                 floaterCount: floaterCount,
                 hazeRemovedCount: hazeRemovedCount,
-                subjectIsolatedCount: subjectIsolatedCount,
+                subjectIsolatedCount: subjectIsolatedCount + hullExcludedCount,
                 planeFound: plane != nil,
                 orbitRadius: rawOrbitRadius * normalization,
                 isEnvironment: isEnvironment,

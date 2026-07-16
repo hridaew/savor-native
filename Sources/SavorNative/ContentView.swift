@@ -655,14 +655,13 @@ struct ContentView: View {
         .savorBarShadow()
     }
 
-    /// Speaker toggle + volume, prominent in the top bar. The slider
-    /// reveals only while sound is on.
+    /// Speaker toggle + volume, prominent in the top bar. The slider stays
+    /// in the hierarchy and animates its width, so the bar's other controls
+    /// reflow smoothly instead of jumping around an inserted view.
     private var audioControls: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: audio.isPlaying ? 8 : 0) {
             Button {
-                withAnimation(.easeOut(duration: 0.2)) {
-                    audio.isPlaying.toggle()
-                }
+                audio.isPlaying.toggle()
             } label: {
                 Image(systemName: audio.isPlaying
                     ? "speaker.wave.2.fill"
@@ -672,16 +671,14 @@ struct ContentView: View {
             .buttonStyle(.bordered)
             .tint(.white)
             .help("Loop the capture's original soundtrack")
-            if audio.isPlaying {
-                Slider(value: $audio.volume, in: 0...1)
-                    .controlSize(.small)
-                    .tint(.white)
-                    .frame(width: 110)
-                    .transition(
-                        .move(edge: .leading).combined(with: .opacity)
-                    )
-                    .help("Volume (normalized across captures)")
-            }
+            Slider(value: $audio.volume, in: 0...1)
+                .controlSize(.small)
+                .tint(.white)
+                .frame(width: audio.isPlaying ? 110 : 0)
+                .opacity(audio.isPlaying ? 1 : 0)
+                .clipped()
+                .allowsHitTesting(audio.isPlaying)
+                .help("Volume (normalized across captures)")
         }
         .animation(.easeOut(duration: 0.2), value: audio.isPlaying)
     }

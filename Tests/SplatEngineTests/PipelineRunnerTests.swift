@@ -144,7 +144,8 @@ private struct StubSplatPostprocessor: SplatPostprocessing {
     func process(
         inputURL: URL,
         outputURL: URL,
-        cameraCenters: [SIMD3<Float>]
+        cameraCenters: [SIMD3<Float>],
+        datasetURL: URL?
     ) async throws -> SplatCleaningResult {
         try FileManager.default.createDirectory(
             at: outputURL.deletingLastPathComponent(),

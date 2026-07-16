@@ -18,10 +18,13 @@ enum Phase2Reclean {
             let cameraCenters = TransformsCameraCenters.load(
                 from: datasetURL.appendingPathComponent("transforms.json")
             )
-            let result = try await SplatCleaner.clean(
+            // Same path the app takes: Vision silhouettes when the dataset
+            // has frames, geometric-only otherwise.
+            let result = try await NativeSplatPostprocessor().process(
                 inputURL: inputURL,
                 outputURL: outputURL,
-                cameraCenters: cameraCenters
+                cameraCenters: cameraCenters,
+                datasetURL: datasetURL
             )
             let summary = [
                 "kept=\(result.keptCount)",

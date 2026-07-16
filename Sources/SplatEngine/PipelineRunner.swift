@@ -229,7 +229,7 @@ public struct PipelineRunner: Sendable {
             stage: .postprocessing,
             fraction: 0,
             detail: "Cleaning \(training.gaussianCount.formatted()) Gaussians"
-                + " — floaters, haze, subject isolation"
+                + " — Vision silhouettes, floaters, haze, isolation"
         ))
         let sceneURL = outputURL.appendingPathComponent("scene-hq.ply")
         let cameraCenters = poseEstimation.frames.map { frame in
@@ -243,7 +243,8 @@ public struct PipelineRunner: Sendable {
         let cleaning = try await postprocessor.process(
             inputURL: training.plyURL,
             outputURL: sceneURL,
-            cameraCenters: cameraCenters
+            cameraCenters: cameraCenters,
+            datasetURL: datasetURL
         )
         await progress?(PipelineProgress(
             stage: .postprocessing,
