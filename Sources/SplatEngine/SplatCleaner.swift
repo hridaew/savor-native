@@ -421,38 +421,98 @@ public enum SplatCleaner {
         // per-frame foregrounds, the hull keeps almost nothing, and the
         // verdict stands.
         // The subject is, by construction, the one thing visible from the
-        // whole ring — so a splat is subject only when enough views see it
-        // AND it lands on the silhouette in nearly all of them. Underseen
-        // splats (walls behind the camera for half the orbit, narrow-FOV
-        // margins) are environment by that same construction.
+        // whole ring — so a splat is subject when enough views see it AND it
+        // lands on the silhouette in nearly all of them. Two measured
+        // failure modes temper that rule:
+        // - Underseen near the center: when the camera moves close, the
+        //   subject's top/bottom clips the frame edge and its visibility
+        //   collapses. Underseen splats are excluded only beyond
+        //   0.6×orbit — walls live out there; clipped subject parts don't.
+        // - Degraded registration: when pose tracking is poor the subject's
+        //   consensus mode lands below the usual ~1.0. A fixed threshold
+        //   would gut it, so the threshold steps down (never below 0.5)
+        //   until a sane fraction of the cloud survives.
         var isOutsideHull = [Bool](repeating: false, count: count)
+        // Mask-confirmed subject points: direct image evidence, which the
+        // geometric haze pass below is not allowed to override.
+        var isHullSubject = [Bool](repeating: false, count: count)
         var hullExcludedCount = 0
         var hullIsConsistentSubject = false
+        // Where the masks say the subject is: the median of the core.
+        // The scene median is NOT safe here — heavy environment drags it
+        // away from the subject, and the rescue would anchor on the room.
+        var subjectAnchor = center
         if let silhouettes, configuration.isolateSubject {
-            var candidateCount = 0
-            var coreCount = 0
-            var outside = [Bool](repeating: false, count: count)
+            var verdicts = [(index: Int, seenBy: Int, ratio: Float)]()
+            verdicts.reserveCapacity(count - floaterCount)
             for index in points.indices where !isFloater[index] {
-                candidateCount += 1
                 let verdict = silhouettes.consensus(for: positions[index])
-                if verdict.seenBy >= configuration.maskMinimumViews,
-                   verdict.ratio >= configuration.maskConsensusThreshold {
-                    coreCount += 1
-                } else {
-                    outside[index] = true
-                }
+                verdicts.append((index, verdict.seenBy, verdict.ratio))
             }
-            // A coherent 3D body reprojecting into the masks from all around
-            // the ring (≥2% of the cloud) means the user filmed a thing —
-            // random per-frame foregrounds (a room) never agree in 3D. It
-            // also vetoes the mass-ratio environment guess above. Below 2%
-            // the masks missed the subject; applying them would hollow the
-            // capture out, so they are discarded entirely.
+            let candidateCount = verdicts.count
+            let nearRadius = rawOrbitRadius > 0
+                ? 0.6 * rawOrbitRadius
+                : Float.infinity
+            func keepSet(
+                threshold: Float
+            ) -> (
+                kept: [Bool],
+                keptCount: Int,
+                coreCount: Int,
+                anchor: SIMD3<Float>
+            ) {
+                var kept = [Bool](repeating: false, count: count)
+                var keptCount = 0
+                var corePositions: [SIMD3<Float>] = []
+                for verdict in verdicts
+                where verdict.seenBy >= configuration.maskMinimumViews
+                    && verdict.ratio >= threshold {
+                    kept[verdict.index] = true
+                    keptCount += 1
+                    corePositions.append(positions[verdict.index])
+                }
+                let anchor = corePositions.isEmpty ? center : SIMD3(
+                    median(corePositions.map(\.x)),
+                    median(corePositions.map(\.y)),
+                    median(corePositions.map(\.z))
+                )
+                // Rescue pass: underseen splats near the core are the
+                // subject's frame-clipped parts, not environment.
+                for verdict in verdicts
+                where verdict.seenBy < configuration.maskMinimumViews {
+                    if simd_length(
+                        positions[verdict.index] - anchor
+                    ) <= nearRadius {
+                        kept[verdict.index] = true
+                        keptCount += 1
+                    }
+                }
+                return (kept, keptCount, corePositions.count, anchor)
+            }
+            var threshold = configuration.maskConsensusThreshold
+            var selection = keepSet(threshold: threshold)
+            while candidateCount > 0,
+                  Float(selection.keptCount) / Float(candidateCount) < 0.08,
+                  threshold > 0.5 {
+                threshold -= 0.1
+                selection = keepSet(threshold: threshold)
+            }
+            // The object-capture evidence is the CORE — well-seen splats the
+            // masks agree on (≥2% of the cloud means a coherent body
+            // reprojects from all around the ring; random per-frame
+            // foregrounds in a room never agree in 3D). Rescued underseen
+            // points deliberately don't count: a room's floor near its
+            // center must not let the room veto its own environment verdict.
             hullIsConsistentSubject = candidateCount > 0
-                && Float(coreCount) / Float(candidateCount) >= 0.02
+                && Float(selection.coreCount) / Float(candidateCount) >= 0.02
             if hullIsConsistentSubject {
-                isOutsideHull = outside
-                hullExcludedCount = candidateCount - coreCount
+                subjectAnchor = selection.anchor
+                isHullSubject = selection.kept
+                for verdict in verdicts
+                where !selection.kept[verdict.index] {
+                    isOutsideHull[verdict.index] = true
+                    hullExcludedCount += 1
+                }
             }
         }
         let isEnvironment = massEnvironment && !hullIsConsistentSubject
@@ -478,8 +538,10 @@ public enum SplatCleaner {
         var isHaze = [Bool](repeating: false, count: count)
         var hazeRemovedCount = 0
         if shouldRunOrbitHaze {
-            for index in points.indices where !isFloater[index] {
-                let distance = simd_length(positions[index] - center)
+            for index in points.indices
+            where !isFloater[index] && !isHullSubject[index]
+                && !isOutsideHull[index] {
+                let distance = simd_length(positions[index] - subjectAnchor)
                 guard distance >= hazeInnerRadius, distance <= hazeOuterRadius else {
                     continue
                 }
@@ -550,7 +612,7 @@ public enum SplatCleaner {
             horizontalU = simd_normalize(horizontalU)
             let horizontalV = simd_normalize(simd_cross(worldUp, horizontalU))
             func columnKey(_ p: SIMD3<Float>) -> Int64 {
-                let d = p - center
+                let d = p - subjectAnchor
                 let a = Int64(floor(simd_dot(d, horizontalU) / cell))
                 let b = Int64(floor(simd_dot(d, horizontalV) / cell))
                 return a &* 1_000_003 &+ b
@@ -564,7 +626,9 @@ public enum SplatCleaner {
             where !isFloater[index] && !isHaze[index]
                 && !isOutsideHull[index] {
                 postHazeCount += 1
-                guard simd_length(positions[index] - center) <= keepRadius else {
+                guard simd_length(
+                    positions[index] - subjectAnchor
+                ) <= keepRadius else {
                     continue
                 }
                 let key = subjectKey(positions[index])
@@ -592,7 +656,7 @@ public enum SplatCleaner {
                     }
                     occupied.insert(key)
                 }
-                let centerKey = subjectKey(center)
+                let centerKey = subjectKey(subjectAnchor)
                 var seed: VoxelKey?
                 var bestSeedDistance = Int.max
                 for key in occupied {
@@ -665,7 +729,9 @@ public enum SplatCleaner {
                 for index in points.indices
                 where !isFloater[index] && !isHaze[index]
                     && !isOutsideHull[index] {
-                    let inside = simd_length(positions[index] - center) <= keepRadius
+                    let inside = simd_length(
+                        positions[index] - subjectAnchor
+                    ) <= keepRadius
                         && component.contains(subjectKey(positions[index]))
                     if !inside {
                         isOutsideSubject[index] = true
@@ -700,8 +766,17 @@ public enum SplatCleaner {
             hullExcludedCount = 0
         }
 
+        // Frame the OUTPUT around what actually survived. Isolation can
+        // remove most of the scene, and the pre-isolation center then sits
+        // meters away from the kept subject — the viewer opened off-center
+        // on exactly the captures that cleaned the hardest.
+        let keptCenter = SIMD3(
+            median(keptIndices.map { positions[$0].x }),
+            median(keptIndices.map { positions[$0].y }),
+            median(keptIndices.map { positions[$0].z })
+        )
         let keptDistances = keptIndices
-            .map { simd_length(positions[$0] - center) }
+            .map { simd_length(positions[$0] - keptCenter) }
             .sorted()
         let frameRadius = max(
             percentile(keptDistances, configuration.framePercentile),
@@ -709,7 +784,7 @@ public enum SplatCleaner {
         )
         let keptCompactDistances = keptIndices
             .filter { sizes[$0] <= 2 * medianSize }
-            .map { simd_length(positions[$0] - center) }
+            .map { simd_length(positions[$0] - keptCenter) }
             .sorted()
         let frameCompactRadius = max(
             percentile(
@@ -724,12 +799,19 @@ public enum SplatCleaner {
         cleanedPoints.reserveCapacity(keptIndices.count)
         for index in keptIndices {
             var point = points[index]
-            point.position = (point.position - center) * normalization
+            point.position = (point.position - keptCenter) * normalization
             point.scale = .exponent(
                 point.scale.asExponent + SIMD3(repeating: logNormalization)
             )
             cleanedPoints.append(point)
         }
+
+        let keptOrbitDistances = cameraCenters
+            .map { simd_length($0 - keptCenter) }
+            .sorted()
+        let keptOrbitRadius = keptOrbitDistances.isEmpty
+            ? 0
+            : keptOrbitDistances[keptOrbitDistances.count / 2]
 
         let normalizedCameraPosition: SIMD3<Float>?
         if cameraCenters.isEmpty {
@@ -741,13 +823,13 @@ public enum SplatCleaner {
                 median(cameraCenters.map(\.z))
             )
             normalizedCameraPosition =
-                (medianCameraPosition - center) * normalization
+                (medianCameraPosition - keptCenter) * normalization
         }
 
         return CleanedSplatPoints(
             points: cleanedPoints,
             statistics: SplatCleaningResult(
-                center: center,
+                center: keptCenter,
                 radius: frameRadius,
                 compactRadius: frameCompactRadius * normalization,
                 totalCount: count,
@@ -756,7 +838,7 @@ public enum SplatCleaner {
                 hazeRemovedCount: hazeRemovedCount,
                 subjectIsolatedCount: subjectIsolatedCount + hullExcludedCount,
                 planeFound: plane != nil,
-                orbitRadius: rawOrbitRadius * normalization,
+                orbitRadius: keptOrbitRadius * normalization,
                 isEnvironment: isEnvironment,
                 cameraPosition: normalizedCameraPosition,
                 worldUp: worldUp

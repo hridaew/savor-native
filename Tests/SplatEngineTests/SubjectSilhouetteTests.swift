@@ -219,6 +219,122 @@ final class SubjectSilhouetteTests: XCTestCase {
         )
     }
 
+    /// The IMG_9033/IMG_1569 truncation case: when the camera moves close,
+    /// the subject's top clips the frame edge and becomes underseen — it
+    /// must be rescued (it's near the subject center), while underseen
+    /// environment far beyond the orbit is still cut.
+    func testRescuesFrameClippedSubjectTop() throws {
+        // A continuous column (like a bottle): the lower part is in-frame
+        // from every view (core); the top clips out of the narrow FOV in
+        // all of them (underseen) but stays connected and near the core.
+        var points: [SIMD3<Float>] = []
+        for step in 0...5 {
+            points += makeDenseBlob(
+                center: SIMD3(0, Float(step) * 0.09, 0),
+                half: 2
+            )
+        }
+        let subjectCount = points.count
+        // Far underseen environment, symmetric so the scene median stays
+        // near the subject.
+        points += makeDenseBlob(center: SIMD3(2, 0, 0), half: 2)
+        points += makeDenseBlob(center: SIMD3(-2, 0.1, 0.2), half: 2)
+        let cameras = ring(radius: 1.1)
+        let silhouettes = SubjectSilhouettes(views: cameras.map { eye in
+            silhouetteView(
+                eye: eye,
+                subjectPoints: Array(points.prefix(subjectCount))
+            )
+        })
+
+        let output = try SplatCleaner.cleanPoints(
+            points.map(makePoint),
+            cameraCenters: cameras,
+            silhouettes: silhouettes,
+            configuration: SplatCleaningConfiguration(maskMinimumViews: 4)
+        )
+
+        // Both subject blobs survive; the far blobs are gone.
+        XCTAssertGreaterThan(
+            output.points.count,
+            Int(Double(subjectCount) * 0.9)
+        )
+        XCTAssertLessThanOrEqual(output.points.count, subjectCount)
+    }
+
+    /// Degraded registration (the split-skull case): the subject's
+    /// consensus mode sits well below the usual ~1.0 because half the poses
+    /// disagree. The threshold must step down rather than gut the subject.
+    func testAdaptiveThresholdSurvivesDegradedConsensus() throws {
+        var points = makeDenseBlob(center: .zero, half: 2)
+        let subjectCount = points.count
+        points += makeDenseBlob(center: SIMD3(0.6, 0, 0), half: 2)
+        let cameras = ring(radius: 1.1)
+        // 5 of 12 views have empty masks (a mis-registered sub-orbit):
+        // subject ratio ≈ 7/12 ≈ 0.58 — below the 0.8 default.
+        let silhouettes = SubjectSilhouettes(
+            views: cameras.enumerated().map { index, eye in
+                if index % 3 == 2 || index % 4 == 3 {
+                    return makeView(
+                        cameraToWorld: lookAt(eye: eye, target: .zero),
+                        mask: [Bool](repeating: false, count: 200 * 200)
+                    )
+                }
+                return silhouetteView(
+                    eye: eye,
+                    subjectPoints: Array(points.prefix(subjectCount))
+                )
+            }
+        )
+
+        let output = try SplatCleaner.cleanPoints(
+            points.map(makePoint),
+            cameraCenters: cameras,
+            silhouettes: silhouettes,
+            configuration: SplatCleaningConfiguration(maskMinimumViews: 4)
+        )
+
+        // The subject survives; the off-silhouette blob is still cut.
+        XCTAssertGreaterThan(
+            output.points.count,
+            Int(Double(subjectCount) * 0.9)
+        )
+        XCTAssertLessThanOrEqual(output.points.count, subjectCount)
+    }
+
+    /// After isolation removes most of a scene, the output must be framed
+    /// around what survived — not the pre-isolation center.
+    func testCleanedOutputIsCenteredOnKeptSubject() throws {
+        var points = makeDenseBlob(center: SIMD3(0.3, 0, 0), half: 2)
+        let subjectCount = points.count
+        points += makeDenseBlob(center: SIMD3(-0.9, 0.1, 0.2), half: 3)
+        let cameras = ring(radius: 1.1).map { $0 + SIMD3(0.3, 0, 0) }
+        let silhouettes = SubjectSilhouettes(views: cameras.map { eye in
+            silhouetteView(
+                eye: eye,
+                subjectPoints: Array(points.prefix(subjectCount)),
+                target: SIMD3(0.3, 0, 0)
+            )
+        })
+
+        let output = try SplatCleaner.cleanPoints(
+            points.map(makePoint),
+            cameraCenters: cameras,
+            silhouettes: silhouettes,
+            configuration: SplatCleaningConfiguration(maskMinimumViews: 4)
+        )
+
+        XCTAssertLessThanOrEqual(output.points.count, subjectCount)
+        let centroid = output.points.reduce(SIMD3<Float>.zero) {
+            $0 + $1.position
+        } / Float(max(output.points.count, 1))
+        XCTAssertLessThan(
+            simd_length(centroid),
+            0.2,
+            "Cleaned output must be centered on the kept subject."
+        )
+    }
+
     // MARK: - Helpers
 
     /// A silhouette view whose mask is exactly the projection of the given
@@ -227,10 +343,11 @@ final class SubjectSilhouetteTests: XCTestCase {
     private func silhouetteView(
         eye: SIMD3<Float>,
         subjectPoints: [SIMD3<Float>],
-        focalLength: Float = 300
+        focalLength: Float = 300,
+        target: SIMD3<Float> = .zero
     ) -> SubjectSilhouettes.View {
         let allTrue = makeView(
-            cameraToWorld: lookAt(eye: eye, target: .zero),
+            cameraToWorld: lookAt(eye: eye, target: target),
             mask: [Bool](repeating: true, count: 200 * 200),
             focalLength: focalLength
         )
@@ -242,7 +359,7 @@ final class SubjectSilhouetteTests: XCTestCase {
         }
         mask = SubjectMaskGenerator.dilated(mask, width: 200, height: 200)
         return makeView(
-            cameraToWorld: lookAt(eye: eye, target: .zero),
+            cameraToWorld: lookAt(eye: eye, target: target),
             mask: mask,
             focalLength: focalLength
         )

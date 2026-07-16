@@ -72,12 +72,47 @@ final class SplatViewRenderer: NSObject, MTKViewDelegate {
         view.colorPixelFormat = .bgra8Unorm_srgb
         view.depthStencilPixelFormat = .depth32Float
         view.sampleCount = 1
+        // 60 is plenty for orbiting a static scene; uncapped ProMotion
+        // doubles the GPU bill for nothing.
+        view.preferredFramesPerSecond = 60
         view.clearColor = MTLClearColor(
             red: 0.018,
             green: 0.021,
             blue: 0.026,
             alpha: 1
         )
+    }
+
+    // MARK: - Idle power
+
+    private var idlePauseTask: Task<Void, Never>?
+
+    /// Keeps the render loop running only while something is moving. After
+    /// two quiet seconds the MTKView pauses and draws on demand — idle GPU
+    /// use drops to zero instead of re-rendering a static scene at 60 fps.
+    private func noteActivity() {
+        view.isPaused = false
+        view.enableSetNeedsDisplay = false
+        idlePauseTask?.cancel()
+        guard !autoRotate else {
+            return
+        }
+        idlePauseTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(2))
+            guard let self, !Task.isCancelled, !self.autoRotate else {
+                return
+            }
+            self.view.isPaused = true
+            self.view.enableSetNeedsDisplay = true
+            self.view.needsDisplay = true
+            // A late splat re-sort can improve draw order after pausing;
+            // render once more when it lands.
+            self.splatRenderer?.afterNextSort { [weak self] in
+                Task { @MainActor in
+                    self?.view.needsDisplay = true
+                }
+            }
+        }
     }
 
     func load(
@@ -177,6 +212,7 @@ final class SplatViewRenderer: NSObject, MTKViewDelegate {
                 } else {
                     status(.ready(pointCount: culled.count))
                 }
+                noteActivity()
             } catch is CancellationError {
                 return
             } catch {
@@ -190,27 +226,36 @@ final class SplatViewRenderer: NSObject, MTKViewDelegate {
 
     func orbit(deltaX: Float, deltaY: Float) {
         camera.orbit(deltaX: deltaX, deltaY: deltaY)
+        noteActivity()
     }
 
     func pan(deltaX: Float, deltaY: Float) {
         camera.pan(deltaX: deltaX, deltaY: deltaY)
+        noteActivity()
     }
 
     func magnify(by amount: Float) {
         camera.zoom(magnification: amount, sensitivity: 1.5)
+        noteActivity()
     }
 
     func scroll(by amount: Float) {
         camera.zoom(magnification: amount, sensitivity: 0.01)
+        noteActivity()
     }
 
     func resetCamera() {
         camera = homeCamera
+        noteActivity()
     }
 
     func setAutoRotate(_ enabled: Bool) {
+        guard enabled != autoRotate else {
+            return
+        }
         autoRotate = enabled
         lastDrawTime = ProcessInfo.processInfo.systemUptime
+        noteActivity()
     }
 
     func setVerticalOrientation(
@@ -225,6 +270,7 @@ final class SplatViewRenderer: NSObject, MTKViewDelegate {
         let axis = effectiveVerticalAxis()
         camera.setVerticalAxis(axis)
         homeCamera.setVerticalAxis(axis)
+        noteActivity()
     }
 
     private func effectiveVerticalAxis() -> ViewerVerticalAxis {
@@ -410,6 +456,7 @@ final class SplatViewRenderer: NSObject, MTKViewDelegate {
                 await splatRenderer.removeAllChunks()
                 await splatRenderer.addChunk(chunk)
                 self.statusHandler?(.ready(pointCount: points.count))
+                self.noteActivity()
             } catch {
                 Self.logger.error(
                     "Unable to rebuild chunk: \(error.localizedDescription)"
@@ -552,7 +599,7 @@ final class SplatViewRenderer: NSObject, MTKViewDelegate {
         // would force a splat re-sort between every export frame — pause it.
         view.isPaused = true
         defer {
-            view.isPaused = false
+            noteActivity()
         }
         let target = try makeOffscreenTarget(
             width: Int(size.width),
