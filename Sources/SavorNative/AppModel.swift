@@ -18,6 +18,7 @@ final class AppModel: ObservableObject {
     private var pipelineTask: Task<Void, Never>?
     private var previewPollTask: Task<Void, Never>?
     private var admission = CaptureAdmission()
+    private var finishEarlyRequested = false
 
     init(repository: CaptureRepository = CaptureRepository(
         rootURL: AppModel.defaultCapturesURL
@@ -66,6 +67,26 @@ final class AppModel: ObservableObject {
     }
 
     func cancelCurrentCapture() {
+        pipelineTask?.cancel()
+    }
+
+    /// True once training has produced at least one checkpoint the pipeline
+    /// could stop at and clean instead of running the full schedule.
+    var canFinishTrainingEarly: Bool {
+        runningCaptureID != nil
+            && pipelineProgress?.stage == .training
+            && instantPreviewURL?.lastPathComponent.hasPrefix("splat_")
+                == true
+    }
+
+    /// Stops training at the latest exported checkpoint and runs cleanup on
+    /// it — for when the preview already looks good and waiting out the full
+    /// 15k steps isn't worth it.
+    func finishTrainingEarly() {
+        guard canFinishTrainingEarly else {
+            return
+        }
+        finishEarlyRequested = true
         pipelineTask?.cancel()
     }
 
@@ -227,7 +248,21 @@ final class AppModel: ObservableObject {
             replace(completed)
             NSSound(named: "Glass")?.play()
         } catch is CancellationError {
-            if let record {
+            if let record, finishEarlyRequested {
+                // Runs in a fresh task: this one is already cancelled, and
+                // the cleaner's own cancellation checks would abort it.
+                let id = record.id
+                let finishTask = Task { [weak self] in
+                    await self?.completeFromLatestCheckpoint(id) ?? false
+                }
+                if await !finishTask.value {
+                    await transitionAfterFailure(
+                        id,
+                        state: .cancelled,
+                        message: "No usable training checkpoint was found."
+                    )
+                }
+            } else if let record {
                 await transitionAfterFailure(
                     record.id,
                     state: .cancelled,
@@ -252,7 +287,58 @@ final class AppModel: ObservableObject {
         previewPollTask?.cancel()
         previewPollTask = nil
         instantPreviewURL = nil
+        finishEarlyRequested = false
         admission.release()
+    }
+
+    /// Cleans the newest intact training checkpoint and completes the
+    /// capture with it. Falls back through older checkpoints if the newest
+    /// was caught mid-write.
+    private func completeFromLatestCheckpoint(_ id: UUID) async -> Bool {
+        let workspace = repository.workspaceURL(for: id)
+        let trainingURL = workspace
+            .appendingPathComponent("training", isDirectory: true)
+        let sceneURL = workspace
+            .appendingPathComponent("output/scene-hq.ply")
+        let cameraCenters = TransformsCameraCenters.load(
+            from: workspace.appendingPathComponent("dataset/transforms.json")
+        )
+        for checkpoint in Self.checkpointPLYs(in: trainingURL) {
+            do {
+                pipelineProgress = PipelineProgress(
+                    stage: .postprocessing,
+                    fraction: 0,
+                    detail: "Finishing early — cleaning "
+                        + checkpoint.lastPathComponent
+                )
+                replace(try await repository.transition(
+                    id,
+                    to: .postprocessing
+                ))
+                if FileManager.default.fileExists(atPath: sceneURL.path) {
+                    try FileManager.default.removeItem(at: sceneURL)
+                }
+                let result = try await NativeSplatPostprocessor().process(
+                    inputURL: checkpoint,
+                    outputURL: sceneURL,
+                    cameraCenters: cameraCenters
+                )
+                let completed = try await repository.transition(
+                    id,
+                    to: .completed,
+                    splatRelativePath: "output/scene-hq.ply",
+                    rawSplatRelativePath:
+                        "training/\(checkpoint.lastPathComponent)",
+                    cleaning: CaptureCleaningSummary(result)
+                )
+                replace(completed)
+                NSSound(named: "Glass")?.play()
+                return true
+            } catch {
+                continue
+            }
+        }
+        return false
     }
 
     /// Keeps `instantPreviewURL` pointed at the best preview available while
@@ -298,12 +384,17 @@ final class AppModel: ObservableObject {
 
     /// Newest `splat_<step>.ply` checkpoint the trainer has exported.
     private static func newestCheckpointPLY(in trainingURL: URL) -> URL? {
+        checkpointPLYs(in: trainingURL).first
+    }
+
+    /// `splat_<step>.ply` checkpoints, newest first.
+    private static func checkpointPLYs(in trainingURL: URL) -> [URL] {
         guard let names = try? FileManager.default.contentsOfDirectory(
             atPath: trainingURL.path
         ) else {
-            return nil
+            return []
         }
-        let best = names.compactMap { name -> (step: Int, name: String)? in
+        return names.compactMap { name -> (step: Int, name: String)? in
             guard name.hasPrefix("splat_"), name.hasSuffix(".ply") else {
                 return nil
             }
@@ -313,11 +404,8 @@ final class AppModel: ObservableObject {
             }
             return (step, name)
         }
-        .max { $0.step < $1.step }
-        guard let best else {
-            return nil
-        }
-        return trainingURL.appendingPathComponent(best.name)
+        .sorted { $0.step > $1.step }
+        .map { trainingURL.appendingPathComponent($0.name) }
     }
 
     private func receive(

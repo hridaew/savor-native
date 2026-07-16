@@ -15,7 +15,10 @@ struct SplatMetalView: NSViewRepresentable {
     @Binding var status: ViewerStatus
     let resetToken: Int
     let autoRotate: Bool
-    let verticalAxis: ViewerVerticalAxis
+    /// Used only when the capture itself carries no orientation signal.
+    var fallbackVerticalAxis: ViewerVerticalAxis = .yUp
+    /// User override on top of the auto-detected orientation.
+    var flipVertical = false
     var customCleanFraction: Float?
     var proxy: SplatViewerProxy?
 
@@ -108,7 +111,10 @@ struct SplatMetalView: NSViewRepresentable {
         proxy?.renderer = renderer
         view.delegate = renderer
             renderer.setAutoRotate(autoRotate)
-            renderer.setVerticalAxis(verticalAxis)
+            renderer.setVerticalOrientation(
+                fallback: fallbackVerticalAxis,
+                flip: flipVertical
+            )
             renderer.setCustomCleanFraction(customCleanFraction)
         view.onScroll = { [weak renderer] delta in
             renderer?.scroll(by: Float(delta))
@@ -152,7 +158,10 @@ struct SplatMetalView: NSViewRepresentable {
             proxy.renderer = context.coordinator.renderer
         }
             context.coordinator.renderer?.setAutoRotate(autoRotate)
-            context.coordinator.renderer?.setVerticalAxis(verticalAxis)
+            context.coordinator.renderer?.setVerticalOrientation(
+                fallback: fallbackVerticalAxis,
+                flip: flipVertical
+            )
             context.coordinator.renderer?
                 .setCustomCleanFraction(customCleanFraction)
             if context.coordinator.appliedResetToken != resetToken {

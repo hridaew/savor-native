@@ -558,6 +558,41 @@ public enum SplatCleaner {
                         }
                     }
                 }
+                // Reclaim thin attached surface: voxels under the mass floor
+                // never entered the flood fill, so sparse-but-real surface
+                // regions (grazing-angle shells, thin rims) punched
+                // see-through holes in the kept subject. Any voxel with mass
+                // that touches the kept component is surface, not
+                // environment — dilate the component by one voxel, still
+                // honoring column support below the plane.
+                if !component.isEmpty {
+                    var reclaimed: [VoxelKey] = []
+                    for key in voxelMass.keys where !component.contains(key) {
+                        if plane != nil,
+                           voxelHasAbove[key] != true,
+                           let column = voxelColumn[key],
+                           !columnsWithBodyAbove.contains(column) {
+                            continue
+                        }
+                        var touchesComponent = false
+                        outer: for dx in -1...1 {
+                            for dy in -1...1 {
+                                for dz in -1...1 {
+                                    if component.contains(
+                                        key.offset(dx, dy, dz)
+                                    ) {
+                                        touchesComponent = true
+                                        break outer
+                                    }
+                                }
+                            }
+                        }
+                        if touchesComponent {
+                            reclaimed.append(key)
+                        }
+                    }
+                    component.formUnion(reclaimed)
+                }
                 for index in points.indices
                 where !isFloater[index] && !isHaze[index] {
                     let inside = simd_length(positions[index] - center) <= keepRadius
@@ -657,40 +692,14 @@ public enum SplatCleaner {
         )
     }
 
-    /// Orbit-axis up estimate: sum of cross products of successive camera
-    /// offsets around their centroid is the ring's axis (robust for the
-    /// ring-like paths PoseSanity already enforces). Sign is chosen so the
-    /// camera ring sits above the subject — captures orbit looking slightly
-    /// down. Returns nil for too-few cameras or a degenerate (straight-line)
-    /// path.
     private static func estimateWorldUp(
         cameraCenters: [SIMD3<Float>],
         subjectCenter: SIMD3<Float>
     ) -> SIMD3<Float>? {
-        guard cameraCenters.count >= 8 else {
-            return nil
-        }
-        let centroid = cameraCenters.reduce(SIMD3<Float>.zero, +)
-            / Float(cameraCenters.count)
-        var axis = SIMD3<Float>.zero
-        for index in 1..<cameraCenters.count {
-            axis += simd_cross(
-                cameraCenters[index - 1] - centroid,
-                cameraCenters[index] - centroid
-            )
-        }
-        let length = simd_length(axis)
-        let spread = cameraCenters
-            .map { simd_length($0 - centroid) }
-            .max() ?? 0
-        guard spread > 0, length > 0.1 * spread * spread else {
-            return nil
-        }
-        axis /= length
-        if simd_dot(axis, centroid - subjectCenter) < 0 {
-            axis = -axis
-        }
-        return axis
+        OrbitUpEstimator.estimate(
+            cameraCenters: cameraCenters,
+            subjectCenter: subjectCenter
+        )
     }
 
     private static func estimateSupportPlane(

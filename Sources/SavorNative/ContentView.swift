@@ -19,7 +19,7 @@ struct ContentView: View {
     @State private var viewerStatus: ViewerStatus = .idle
     @State private var viewerResetToken = 0
     @State private var viewerAutoRotate = false
-    @State private var viewerVerticalAxis: ViewerVerticalAxis = .yUp
+    @State private var viewerFlipVertical = false
     @State private var viewMode: SplatViewMode = .cleaned
     @State private var cleanAmount = 0.5
     @State private var captureToDelete: CaptureRecord?
@@ -97,6 +97,7 @@ struct ContentView: View {
         }
         .onChange(of: model.selectedCaptureID) { _, _ in
             viewMode = .cleaned
+            viewerFlipVertical = false
             viewerResetToken += 1
             videoExportTask?.cancel()
             audio.stop()
@@ -129,7 +130,7 @@ struct ContentView: View {
         VStack(spacing: 0) {
             HStack {
                 Text("SAVOR")
-                    .font(.system(size: 12, weight: .bold, design: .monospaced))
+                    .font(SavorFont.monoBadge)
                     .tracking(2.6)
                 Spacer()
                 Button {
@@ -169,6 +170,39 @@ struct ContentView: View {
                 ) { capture in
                     CaptureRow(capture: capture)
                         .tag(capture.id)
+                        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                            if !capture.state.isInFlight {
+                                Button(role: .destructive) {
+                                    captureToDelete = capture
+                                } label: {
+                                    Label("Delete", systemImage: "trash")
+                                }
+                                Button {
+                                    model.retry(capture)
+                                } label: {
+                                    Label(
+                                        "Start Over",
+                                        systemImage: "arrow.counterclockwise"
+                                    )
+                                }
+                                .tint(.blue)
+                            }
+                        }
+                        .swipeActions(edge: .leading, allowsFullSwipe: false) {
+                            if capture.state == .completed,
+                               let splatURL = model.splatURL(for: capture) {
+                                Button {
+                                    NSWorkspace.shared
+                                        .activateFileViewerSelecting([splatURL])
+                                } label: {
+                                    Label(
+                                        "Reveal",
+                                        systemImage: "magnifyingglass"
+                                    )
+                                }
+                                .tint(.indigo)
+                            }
+                        }
                         .contextMenu {
                             if capture.state == .completed,
                                let splatURL = model.splatURL(for: capture) {
@@ -271,9 +305,9 @@ struct ContentView: View {
                 }
                 VStack(spacing: 9) {
                     Text("Turn a video into a scene.")
-                        .font(.system(size: 34, weight: .medium, design: .serif))
+                        .font(SavorFont.display)
                     Text("Drop an orbit video here, or choose one from disk.")
-                        .font(.system(size: 14))
+                        .font(SavorFont.body)
                         .foregroundStyle(.secondary)
                 }
                 Button("Choose video") {
@@ -319,18 +353,16 @@ struct ContentView: View {
                     status: $viewerStatus,
                     resetToken: viewerResetToken,
                     autoRotate: true,
-                    verticalAxis: .yDown
+                    fallbackVerticalAxis: .yDown
                 )
                 .ignoresSafeArea()
             } else {
                 atmosphericBackground
-                VStack(spacing: 12) {
-                    Image(systemName: "circle.dotted")
-                        .font(.system(size: 42, weight: .thin))
-                        .foregroundStyle(.white.opacity(0.4))
-                    Text("First preview lands after the first "
+                VStack(spacing: 14) {
+                    OrbitLoaderView()
+                    Text("First preview lands with the first "
                         + "training checkpoint.")
-                        .font(.callout)
+                        .font(SavorFont.body)
                         .foregroundStyle(.white.opacity(0.55))
                 }
             }
@@ -340,11 +372,7 @@ struct ContentView: View {
                     if previewURL != nil {
                         Text(isCheckpoint ? "TRAINING PREVIEW — LIVE"
                             : "INSTANT PREVIEW")
-                            .font(.system(
-                                size: 10,
-                                weight: .bold,
-                                design: .monospaced
-                            ))
+                            .font(SavorFont.monoBadge)
                             .tracking(2)
                             .padding(.horizontal, 10)
                             .padding(.vertical, 5)
@@ -368,22 +396,38 @@ struct ContentView: View {
     }
 
     /// Bottom console: what the pipeline is doing right now, verbatim,
-    /// with the stage rail and a thin determinate bar.
+    /// with the stage rail and a thin determinate bar. Every line owns a
+    /// full row so nothing wraps.
     private func processingDebugBar(
         _ capture: CaptureRecord,
         progress: PipelineProgress?
     ) -> some View {
-        VStack(alignment: .leading, spacing: 9) {
-            HStack(alignment: .firstTextBaseline) {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline, spacing: 12) {
                 Text(stageTitle(progress?.stage, fallback: capture.state))
-                    .font(.system(size: 15, weight: .semibold))
+                    .font(SavorFont.title)
                     .foregroundStyle(.white)
-                Spacer()
+                    .lineLimit(1)
+                Spacer(minLength: 12)
                 Text("\(Int(((progress?.fraction ?? 0) * 100).rounded()))%")
-                    .font(.system(size: 12, design: .monospaced))
+                    .font(SavorFont.monoLabel)
                     .monospacedDigit()
                     .foregroundStyle(.white.opacity(0.65))
                 if model.runningCaptureID == capture.id {
+                    if model.canFinishTrainingEarly {
+                        Button("Finish Now") {
+                            model.finishTrainingEarly()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                        .tint(.white)
+                        .foregroundStyle(.black)
+                        .help(
+                            "Stop training here and clean the latest "
+                                + "checkpoint. Fine detail keeps improving "
+                                + "with more steps."
+                        )
+                    }
                     Button("Cancel", role: .destructive) {
                         model.cancelCurrentCapture()
                     }
@@ -398,30 +442,23 @@ struct ContentView: View {
                 .tint(.white)
                 .controlSize(.small)
 
-            HStack(alignment: .center, spacing: 14) {
-                Text(progress?.detail ?? capture.state.displayName)
-                    .font(.system(size: 11, design: .monospaced))
-                    .foregroundStyle(.white.opacity(0.6))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                Spacer()
-                StageRail(current: progress?.stage)
-                    .frame(width: 300)
-            }
+            Text(progress?.detail ?? capture.state.displayName)
+                .font(SavorFont.monoLabel)
+                .foregroundStyle(.white.opacity(0.6))
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            StageRail(current: progress?.stage)
+                .frame(maxWidth: .infinity)
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 14)
-        .background(
-            .black.opacity(0.6),
+        .savorBar(
             in: RoundedRectangle(cornerRadius: 14, style: .continuous)
         )
-        .overlay(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .stroke(.white.opacity(0.08), lineWidth: 1)
-        )
-        .shadow(color: .black.opacity(0.35), radius: 18, y: 8)
-        .shadow(color: .black.opacity(0.18), radius: 3, y: 1)
-        .frame(maxWidth: 760)
+        .savorBarShadow()
+        .frame(maxWidth: 720)
         .animation(.easeOut(duration: 0.2), value: progress?.detail)
     }
 
@@ -441,9 +478,9 @@ struct ContentView: View {
                 Text(capture.state == .interrupted
                     ? "Capture interrupted"
                     : "Capture incomplete")
-                    .font(.system(size: 30, weight: .medium, design: .serif))
+                    .font(SavorFont.display)
                 Text(message)
-                    .font(.callout)
+                    .font(SavorFont.body)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
                     .frame(maxWidth: 440)
@@ -480,7 +517,7 @@ struct ContentView: View {
                 status: $viewerStatus,
                 resetToken: viewerResetToken,
                 autoRotate: viewerAutoRotate,
-                verticalAxis: viewerVerticalAxis,
+                flipVertical: viewerFlipVertical,
                 customCleanFraction: viewMode == .custom
                     ? Float(cleanAmount)
                     : nil,
@@ -501,7 +538,7 @@ struct ContentView: View {
                     exportProgressCard(progress)
                         .transition(.opacity)
                 }
-                viewerControls(capture)
+                viewerControls
             }
             .padding(16)
             .animation(.easeOut(duration: 0.22), value: viewMode)
@@ -522,14 +559,16 @@ struct ContentView: View {
         HStack(spacing: 12) {
             VStack(alignment: .leading, spacing: 2) {
                 Text(capture.sourceFilename)
-                    .font(.headline)
+                    .font(SavorFont.title)
                     .lineLimit(1)
                 viewerStatusLabel
-                    .font(.caption)
+                    .font(SavorFont.caption)
             }
             .foregroundStyle(.white)
 
             Spacer()
+
+            audioControls
 
             if hasRawSplat {
                 Picker("Splat view", selection: $viewMode) {
@@ -554,7 +593,10 @@ struct ContentView: View {
                     exportImage(capture)
                 }
                 Button("Orbit Video (MP4)…") {
-                    exportOrbitVideo(capture)
+                    exportOrbitVideo(capture, includeAudio: false)
+                }
+                Button("Orbit Video with Soundtrack…") {
+                    exportOrbitVideo(capture, includeAudio: true)
                 }
                 Divider()
                 Button("Splat (PLY)…") {
@@ -607,15 +649,41 @@ struct ContentView: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 11)
-        .background(
-            .black.opacity(0.58),
+        .savorBar(
             in: RoundedRectangle(cornerRadius: 14, style: .continuous)
         )
-        .overlay(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .stroke(.white.opacity(0.08), lineWidth: 1)
-        )
-        .shadow(color: .black.opacity(0.3), radius: 14, y: 6)
+        .savorBarShadow()
+    }
+
+    /// Speaker toggle + volume, prominent in the top bar. The slider
+    /// reveals only while sound is on.
+    private var audioControls: some View {
+        HStack(spacing: 8) {
+            Button {
+                withAnimation(.easeOut(duration: 0.2)) {
+                    audio.isPlaying.toggle()
+                }
+            } label: {
+                Image(systemName: audio.isPlaying
+                    ? "speaker.wave.2.fill"
+                    : "speaker.slash")
+                    .frame(width: 16)
+            }
+            .buttonStyle(.bordered)
+            .tint(.white)
+            .help("Loop the capture's original soundtrack")
+            if audio.isPlaying {
+                Slider(value: $audio.volume, in: 0...1)
+                    .controlSize(.small)
+                    .tint(.white)
+                    .frame(width: 110)
+                    .transition(
+                        .move(edge: .leading).combined(with: .opacity)
+                    )
+                    .help("Volume (normalized across captures)")
+            }
+        }
+        .animation(.easeOut(duration: 0.2), value: audio.isPlaying)
     }
 
     /// Revealed under the top bar in Custom mode: scrubs from the raw scene
@@ -624,21 +692,21 @@ struct ContentView: View {
         HStack(spacing: 12) {
             Image(systemName: "sparkles")
                 .foregroundStyle(.white.opacity(0.7))
-                .font(.system(size: 12))
+                .font(SavorFont.caption)
             Text("RAW")
-                .font(.system(size: 9, weight: .bold, design: .monospaced))
+                .font(SavorFont.monoHint)
                 .tracking(1.5)
                 .foregroundStyle(.white.opacity(0.5))
             Slider(value: $cleanAmount, in: 0...1)
                 .controlSize(.small)
                 .tint(.white)
             Text("CLEAN")
-                .font(.system(size: 9, weight: .bold, design: .monospaced))
+                .font(SavorFont.monoHint)
                 .tracking(1.5)
                 .foregroundStyle(.white.opacity(0.5))
             if case let .ready(pointCount) = viewerStatus {
                 Text("\(pointCount.formatted()) kept")
-                    .font(.system(size: 11, design: .monospaced))
+                    .font(SavorFont.monoLabel)
                     .monospacedDigit()
                     .foregroundStyle(.white.opacity(0.65))
                     .frame(width: 110, alignment: .trailing)
@@ -646,13 +714,8 @@ struct ContentView: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
-        .background(
-            .black.opacity(0.58),
+        .savorBar(
             in: RoundedRectangle(cornerRadius: 12, style: .continuous)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(.white.opacity(0.08), lineWidth: 1)
         )
         .frame(maxWidth: 560)
     }
@@ -664,7 +727,7 @@ struct ContentView: View {
                 .tint(.white)
                 .frame(width: 220)
             Text("Rendering orbit \(Int((progress * 100).rounded()))%")
-                .font(.system(size: 11, design: .monospaced))
+                .font(SavorFont.monoLabel)
                 .monospacedDigit()
                 .foregroundStyle(.white.opacity(0.7))
             Button("Cancel", role: .cancel) {
@@ -676,15 +739,10 @@ struct ContentView: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
-        .background(
-            .black.opacity(0.65),
+        .savorBar(
             in: RoundedRectangle(cornerRadius: 12, style: .continuous)
         )
-        .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(.white.opacity(0.08), lineWidth: 1)
-        )
-        .shadow(color: .black.opacity(0.3), radius: 14, y: 6)
+        .savorBarShadow()
     }
 
     // MARK: - Standalone viewer
@@ -699,7 +757,7 @@ struct ContentView: View {
                 status: $viewerStatus,
                 resetToken: viewerResetToken,
                 autoRotate: viewerAutoRotate,
-                verticalAxis: isSample ? .yUp : viewerVerticalAxis,
+                flipVertical: viewerFlipVertical,
                 proxy: viewerProxy
             )
                 .ignoresSafeArea()
@@ -707,9 +765,9 @@ struct ContentView: View {
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(isSample ? "Sample splat" : url.lastPathComponent)
-                            .font(.headline)
+                            .font(SavorFont.title)
                         viewerStatusLabel
-                            .font(.caption)
+                            .font(SavorFont.caption)
                     }
                     Spacer()
                     Button {
@@ -731,16 +789,12 @@ struct ContentView: View {
                 .foregroundStyle(.white)
                 .padding(.horizontal, 14)
                 .padding(.vertical, 11)
-                .background(
-                    .black.opacity(0.58),
+                .savorBar(
                     in: RoundedRectangle(cornerRadius: 14, style: .continuous)
                 )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .stroke(.white.opacity(0.08), lineWidth: 1)
-                )
+                .savorBarShadow()
                 Spacer()
-                viewerControls(nil)
+                viewerControls
             }
             .padding(16)
         }
@@ -790,13 +844,19 @@ struct ContentView: View {
         }
     }
 
-    private func exportOrbitVideo(_ capture: CaptureRecord) {
+    private func exportOrbitVideo(
+        _ capture: CaptureRecord,
+        includeAudio: Bool
+    ) {
         let baseName = (capture.sourceFilename as NSString)
             .deletingPathExtension
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.mpeg4Movie]
         panel.nameFieldStringValue = "\(baseName)-orbit.mp4"
         panel.canCreateDirectories = true
+        let audioSourceURL = includeAudio
+            ? model.sourceVideoURL(for: capture)
+            : nil
         panel.begin { response in
             guard response == .OK, let destination = panel.url else {
                 return
@@ -814,6 +874,7 @@ struct ContentView: View {
                     }
                     try await renderer.exportOrbitVideo(
                         to: destination,
+                        audioSourceURL: audioSourceURL,
                         progress: { videoExportProgress = $0 }
                     )
                     NSSound(named: "Glass")?.play()
@@ -854,7 +915,7 @@ struct ContentView: View {
 
     // MARK: - Viewer chrome
 
-    private func viewerControls(_ capture: CaptureRecord?) -> some View {
+    private var viewerControls: some View {
         HStack(spacing: 10) {
             Button {
                 viewerResetToken += 1
@@ -870,50 +931,18 @@ struct ContentView: View {
                 )
             }
             Button {
-                viewerVerticalAxis = viewerVerticalAxis == .yUp
-                    ? .yDown
-                    : .yUp
+                viewerFlipVertical.toggle()
                 viewerResetToken += 1
             } label: {
-                Label(
-                    viewerVerticalAxis == .yUp ? "Y Up" : "Y Down",
-                    systemImage: "arrow.up.and.down"
-                )
+                Label("Flip", systemImage: "arrow.up.and.down")
             }
-
-            if capture != nil {
-                Divider()
-                    .frame(height: 16)
-                Button {
-                    withAnimation(.easeOut(duration: 0.2)) {
-                        audio.isPlaying.toggle()
-                    }
-                } label: {
-                    Label(
-                        audio.isPlaying ? "Sound On" : "Sound",
-                        systemImage: audio.isPlaying
-                            ? "speaker.wave.2.fill"
-                            : "speaker.slash"
-                    )
-                }
-                .help("Loop the capture's original soundtrack")
-                if audio.isPlaying {
-                    Slider(value: $audio.volume, in: 0...1)
-                        .controlSize(.mini)
-                        .tint(.white)
-                        .frame(width: 84)
-                        .transition(
-                            .move(edge: .leading).combined(with: .opacity)
-                        )
-                }
-            }
+            .help(
+                "Flip the scene vertically. Orientation is detected from "
+                    + "the capture automatically — this overrides it."
+            )
 
             Text("LEFT DRAG ORBITS · RIGHT DRAG PANS · SCROLL ZOOMS · R RESETS")
-                .font(.system(
-                    size: 9,
-                    weight: .medium,
-                    design: .monospaced
-                ))
+                .font(SavorFont.monoHint)
                 .tracking(0.8)
                 .foregroundStyle(.white.opacity(0.72))
                 .padding(.leading, 4)
@@ -923,11 +952,8 @@ struct ContentView: View {
         .foregroundStyle(.white)
         .padding(.horizontal, 14)
         .padding(.vertical, 9)
-        .background(.black.opacity(0.55), in: Capsule())
-        .overlay(
-            Capsule().stroke(.white.opacity(0.08), lineWidth: 1)
-        )
-        .shadow(color: .black.opacity(0.3), radius: 14, y: 6)
+        .savorBar(in: Capsule())
+        .savorBarShadow()
     }
 
     @ViewBuilder
@@ -1049,11 +1075,8 @@ private struct StageRail: View {
                         .fill(color(for: entry.0))
                         .frame(width: 7, height: 7)
                     Text(entry.1)
-                        .font(.system(
-                            size: 8,
-                            weight: .medium,
-                            design: .monospaced
-                        ))
+                        .font(SavorFont.monoHint)
+                        .tracking(0.5)
                         .foregroundStyle(.white.opacity(0.55))
                 }
                 if index < stages.count - 1 {

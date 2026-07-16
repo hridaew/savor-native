@@ -37,6 +37,13 @@ final class SplatViewRenderer: NSObject, MTKViewDelegate {
     private var displayPoints: [SplatPoint] = []
     private var statusHandler: (@MainActor (ViewerStatus) -> Void)?
 
+    // Vertical orientation: detected from the capture itself (framing
+    // metadata's worldUp, else the camera-ring orbit axis), with the
+    // caller's fallback when neither exists and a user "flip" override.
+    private var detectedVerticalAxis: ViewerVerticalAxis?
+    private var fallbackVerticalAxis: ViewerVerticalAxis = .yUp
+    private var flipVertical = false
+
     // Live-clean scrubber: point indices sorted by "melts first" score.
     private var customCleanOrder: [Int]?
     private var customCleanFraction: Float?
@@ -118,14 +125,25 @@ final class SplatViewRenderer: NSObject, MTKViewDelegate {
                     return max(scale.x, max(scale.y, scale.z))
                 }
                 let metadata = SplatFramingMetadata.load(near: url)
+                let transformsURL = TransformsCameraCenters
+                    .resolveTransformsURL(near: url)
                 let framing = try SplatSceneFramingResolver.resolve(
                     positions: points.map(\.position),
                     opacities: points.map(\.opacity.asLinearFloat),
                     maxLinearScales: scales,
                     metadata: metadata,
-                    transformsURL: TransformsCameraCenters
-                        .resolveTransformsURL(near: url)
+                    transformsURL: transformsURL
                 )
+                // Orient the scene right-side-up from the capture itself:
+                // the cleaner's recorded worldUp when present, else the
+                // camera-ring orbit axis from transforms.json.
+                detectedVerticalAxis = Self.detectVerticalAxis(
+                    metadata: metadata,
+                    transformsURL: transformsURL,
+                    subjectCenter: framing.center
+                )
+                let verticalAxis = effectiveVerticalAxis()
+                camera.setVerticalAxis(verticalAxis)
                 camera.fit(
                     target: framing.center,
                     radius: framing.radius,
@@ -195,9 +213,26 @@ final class SplatViewRenderer: NSObject, MTKViewDelegate {
         lastDrawTime = ProcessInfo.processInfo.systemUptime
     }
 
-    func setVerticalAxis(_ verticalAxis: ViewerVerticalAxis) {
-        camera.setVerticalAxis(verticalAxis)
-        homeCamera.setVerticalAxis(verticalAxis)
+    func setVerticalOrientation(
+        fallback: ViewerVerticalAxis,
+        flip: Bool
+    ) {
+        guard fallback != fallbackVerticalAxis || flip != flipVertical else {
+            return
+        }
+        fallbackVerticalAxis = fallback
+        flipVertical = flip
+        let axis = effectiveVerticalAxis()
+        camera.setVerticalAxis(axis)
+        homeCamera.setVerticalAxis(axis)
+    }
+
+    private func effectiveVerticalAxis() -> ViewerVerticalAxis {
+        var axis = detectedVerticalAxis ?? fallbackVerticalAxis
+        if flipVertical {
+            axis = axis == .yUp ? .yDown : .yUp
+        }
+        return axis
     }
 
     func draw(in view: MTKView) {
@@ -277,6 +312,34 @@ final class SplatViewRenderer: NSObject, MTKViewDelegate {
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
         drawableSize = size
+    }
+
+    /// Maps a detected world-up direction onto the viewer's y-axis choice.
+    private static func detectVerticalAxis(
+        metadata: SplatFramingMetadata?,
+        transformsURL: URL?,
+        subjectCenter: SIMD3<Float>
+    ) -> ViewerVerticalAxis? {
+        if let metadata {
+            // Cleaned scene: positions are normalized, so the raw-CRS camera
+            // transforms can't be compared against them — only the recorded
+            // worldUp (direction survives the translate+scale) is usable.
+            guard let worldUp = metadata.worldUpVector else {
+                return nil
+            }
+            return worldUp.y >= 0 ? .yUp : .yDown
+        }
+        guard let transformsURL else {
+            return nil
+        }
+        let cameraCenters = TransformsCameraCenters.load(from: transformsURL)
+        guard let axis = OrbitUpEstimator.estimate(
+            cameraCenters: cameraCenters,
+            subjectCenter: subjectCenter
+        ) else {
+            return nil
+        }
+        return axis.y >= 0 ? .yUp : .yDown
     }
 
     // MARK: - Live clean scrubber
@@ -481,6 +544,7 @@ final class SplatViewRenderer: NSObject, MTKViewDelegate {
         duration: Double = 8,
         framesPerSecond: Int = 30,
         size: CGSize = CGSize(width: 1_920, height: 1_080),
+        audioSourceURL: URL? = nil,
         progress: @escaping @MainActor (Double) -> Void
     ) async throws {
         let frameCount = max(1, Int(duration * Double(framesPerSecond)))
@@ -494,11 +558,13 @@ final class SplatViewRenderer: NSObject, MTKViewDelegate {
             width: Int(size.width),
             height: Int(size.height)
         )
-        let writer = try OrbitVideoWriter(
+        let writer = try await OrbitVideoWriter.make(
             outputURL: outputURL,
             width: target.width,
             height: target.height,
-            framesPerSecond: framesPerSecond
+            framesPerSecond: framesPerSecond,
+            audioSourceURL: audioSourceURL,
+            duration: duration
         )
         var orbitCamera = camera
         for frame in 0..<frameCount {
