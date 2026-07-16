@@ -42,14 +42,16 @@ struct PosesCLI {
         print("Input: \(imageURLs.count) images")
         print(
             "Configuration: sequential=\(options.useSequentialOrdering), "
-                + "highSensitivity=\(options.useHighFeatureSensitivity)"
+                + "highSensitivity=\(options.useHighFeatureSensitivity), "
+                + "objectMasking=\(options.useObjectMasking)"
         )
 
         let result = try await PoseEstimator().estimate(
             imagesURL: inputURL,
             options: PoseEstimationOptions(
                 useSequentialOrdering: options.useSequentialOrdering,
-                useHighFeatureSensitivity: options.useHighFeatureSensitivity
+                useHighFeatureSensitivity: options.useHighFeatureSensitivity,
+                isObjectMaskingEnabled: options.useObjectMasking
             ),
             progress: { progress in
                 let percent = Int((progress.fraction * 100).rounded())

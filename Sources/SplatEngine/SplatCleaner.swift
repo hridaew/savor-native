@@ -30,10 +30,14 @@ public struct SplatCleaningConfiguration: Sendable, Equatable {
     /// A voxel counts as subject surface when its summed alpha clears this
     /// fraction of the densest voxel's — filters sparse background voxels.
     public var subjectVoxelMassFloor: Float
-    /// Silhouette-consensus keep threshold: a splat survives when it lands
-    /// on the subject's Vision mask in at least this fraction of the views
-    /// that see it. True subject points score ~1 (silhouette property);
-    /// attached environment and near-surface fog score low from side views.
+    /// Upper bound of the silhouette-consensus keep threshold: a splat
+    /// survives when it lands on the subject's Vision mask in at least this
+    /// fraction of the views that see it. The cleaner starts here and steps
+    /// down (never below 0.5) until a coherent core survives — the HIGHEST
+    /// working threshold wins, so a flickering co-subject (a pedestal the
+    /// masks include only sometimes, scoring ~0.6) is cut whole instead of
+    /// surviving in shreds, while degraded registrations (subject mode
+    /// ~0.6) still keep their subject.
     public var maskConsensusThreshold: Float
     /// A splat must be inside at least this many mask views' frusta to
     /// qualify as subject at all — the subject is visible from the whole
@@ -62,7 +66,7 @@ public struct SplatCleaningConfiguration: Sendable, Equatable {
         subjectOrbitKeepFraction: Float = 0.95,
         subjectVoxelFactor: Float = 0.06,
         subjectVoxelMassFloor: Float = 0.03,
-        maskConsensusThreshold: Float = 0.8,
+        maskConsensusThreshold: Float = 0.9,
         maskMinimumViews: Int = 8,
         subjectKeepMultiplier: Float = 1.08,
         orbitKeepFraction: Float = 0.75,
@@ -445,9 +449,37 @@ public enum SplatCleaner {
         if let silhouettes, configuration.isolateSubject {
             var verdicts = [(index: Int, seenBy: Int, ratio: Float)]()
             verdicts.reserveCapacity(count - floaterCount)
+            let extentSize = 2 * medianSize
             for index in points.indices where !isFloater[index] {
                 let verdict = silhouettes.consensus(for: positions[index])
-                verdicts.append((index, verdict.seenBy, verdict.ratio))
+                var ratio = verdict.ratio
+                // Large soft splats can hide their center inside the
+                // silhouette cone while their body hangs out of it — the
+                // "spilled milk" right off a surface. Test the extremes of
+                // the dominant axis too; a tip that clearly exits the
+                // silhouette (ratio < 0.5) caps the splat's score.
+                if sizes[index] > extentSize, verdict.seenBy > 0 {
+                    let scale = scales[index]
+                    let dominant: SIMD3<Float>
+                    if scale.x >= scale.y && scale.x >= scale.z {
+                        dominant = SIMD3(scale.x, 0, 0)
+                    } else if scale.y >= scale.z {
+                        dominant = SIMD3(0, scale.y, 0)
+                    } else {
+                        dominant = SIMD3(0, 0, scale.z)
+                    }
+                    let axis = points[index].rotation.act(dominant)
+                    for sign in [Float(1), -1] {
+                        let tip = positions[index] + axis * sign
+                        let tipVerdict = silhouettes.consensus(for: tip)
+                        if tipVerdict.seenBy
+                            >= configuration.maskMinimumViews,
+                           tipVerdict.ratio < 0.5 {
+                            ratio = min(ratio, tipVerdict.ratio)
+                        }
+                    }
+                }
+                verdicts.append((index, verdict.seenBy, ratio))
             }
             let candidateCount = verdicts.count
             let nearRadius = rawOrbitRadius > 0
@@ -489,10 +521,15 @@ public enum SplatCleaner {
                 }
                 return (kept, keptCount, corePositions.count, anchor)
             }
+            // Highest threshold that leaves a coherent core (≥2% of the
+            // cloud) wins. Starting strict and stopping at the first
+            // workable threshold cuts flickering co-subjects (a pedestal
+            // scoring ~0.6) whole, instead of stepping down into their mode
+            // and keeping them in shreds.
             var threshold = configuration.maskConsensusThreshold
             var selection = keepSet(threshold: threshold)
             while candidateCount > 0,
-                  Float(selection.keptCount) / Float(candidateCount) < 0.08,
+                  Float(selection.coreCount) / Float(candidateCount) < 0.02,
                   threshold > 0.5 {
                 threshold -= 0.1
                 selection = keepSet(threshold: threshold)

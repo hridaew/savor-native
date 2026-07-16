@@ -335,6 +335,81 @@ final class SubjectSilhouetteTests: XCTestCase {
         )
     }
 
+    /// The IMG_1571 case: masks include the pedestal in only some frames
+    /// (ratio ~0.6) while the subject scores ~1.0. The highest workable
+    /// threshold must win, cutting the flickering pedestal whole instead of
+    /// stepping down into its mode and keeping it in shreds.
+    func testFlickeringCoSubjectIsCutWhole() throws {
+        var points = makeDenseBlob(center: .zero, half: 2)
+        let subjectCount = points.count
+        // Pedestal: attached below, included in only 7 of 12 masks.
+        let pedestal = makeDenseBlob(center: SIMD3(0, -0.12, 0), half: 2)
+        points += pedestal
+        let cameras = ring(radius: 1.1)
+        let silhouettes = SubjectSilhouettes(
+            views: cameras.enumerated().map { index, eye in
+                let maskPoints = index % 12 < 7
+                    ? Array(points.prefix(subjectCount)) + pedestal
+                    : Array(points.prefix(subjectCount))
+                return silhouetteView(eye: eye, subjectPoints: maskPoints)
+            }
+        )
+
+        let output = try SplatCleaner.cleanPoints(
+            points.map(makePoint),
+            cameraCenters: cameras,
+            silhouettes: silhouettes,
+            configuration: SplatCleaningConfiguration(maskMinimumViews: 4)
+        )
+
+        // Subject intact, pedestal fully gone — not partially.
+        XCTAssertGreaterThan(
+            output.points.count,
+            Int(Double(subjectCount) * 0.9)
+        )
+        XCTAssertLessThanOrEqual(
+            output.points.count,
+            Int(Double(subjectCount) * 1.1)
+        )
+    }
+
+    /// "Spilled milk": a large soft splat whose center hides inside the
+    /// silhouette while its body hangs out. The extent test caps its score;
+    /// a small splat at the same position survives.
+    func testExtentTrimCutsLargeSplatPokingOutOfSilhouette() throws {
+        var points = makeDenseBlob(center: .zero, half: 2).map(makePoint)
+        let subjectCount = points.count
+        // Center inside the subject, dominant axis poking far out.
+        points.append(SplatPoint(
+            position: SIMD3(0.02, 0, 0),
+            color: .sphericalHarmonicFloat((0..<9).map {
+                SIMD3<Float>(repeating: Float($0) * 0.01)
+            }),
+            opacity: .linearFloat(0.4),
+            scale: .linearFloat(SIMD3(0.2, 0.05, 0.05)),
+            rotation: simd_quatf(real: 1, imag: .zero)
+        ))
+        let cameras = ring(radius: 1.1)
+        let subjectPositions = points.prefix(subjectCount).map(\.position)
+        let silhouettes = SubjectSilhouettes(views: cameras.map { eye in
+            silhouetteView(eye: eye, subjectPoints: subjectPositions)
+        })
+
+        let output = try SplatCleaner.cleanPoints(
+            points,
+            cameraCenters: cameras,
+            silhouettes: silhouettes,
+            configuration: SplatCleaningConfiguration(maskMinimumViews: 4)
+        )
+
+        // The dense subject survives; the poking splat does not.
+        XCTAssertGreaterThan(
+            output.points.count,
+            Int(Double(subjectCount) * 0.9)
+        )
+        XCTAssertLessThanOrEqual(output.points.count, subjectCount)
+    }
+
     // MARK: - Helpers
 
     /// A silhouette view whose mask is exactly the projection of the given

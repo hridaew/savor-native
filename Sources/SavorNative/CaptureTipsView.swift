@@ -18,8 +18,7 @@ struct CaptureTipsView: View {
                 .frame(height: 190)
                 .frame(maxWidth: .infinity)
 
-            Grid(alignment: .leading, horizontalSpacing: 10,
-                 verticalSpacing: 9) {
+            VStack(alignment: .leading, spacing: 9) {
                 tip(
                     good: true,
                     text: "Walk a slow, full circle around one object "
@@ -52,12 +51,13 @@ struct CaptureTipsView: View {
     }
 
     private func tip(good: Bool, text: String) -> some View {
-        GridRow(alignment: .firstTextBaseline) {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
             Image(systemName: good ? "checkmark.circle.fill" : "xmark.circle")
                 .foregroundStyle(good ? Color.green : Color.secondary)
                 .font(.system(size: 13, weight: .semibold))
             Text(text)
                 .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 }

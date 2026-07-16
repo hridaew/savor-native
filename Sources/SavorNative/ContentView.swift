@@ -171,12 +171,16 @@ struct ContentView: View {
                     CaptureRow(capture: capture)
                         .tag(capture.id)
                         .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                            // Icon-only: the sidebar is narrow, and full
+                            // labels clip when the actions slide in.
                             if !capture.state.isInFlight {
                                 Button(role: .destructive) {
                                     captureToDelete = capture
                                 } label: {
                                     Label("Delete", systemImage: "trash")
+                                        .labelStyle(.iconOnly)
                                 }
+                                .help("Delete capture")
                                 Button {
                                     model.retry(capture)
                                 } label: {
@@ -184,8 +188,10 @@ struct ContentView: View {
                                         "Start Over",
                                         systemImage: "arrow.counterclockwise"
                                     )
+                                    .labelStyle(.iconOnly)
                                 }
                                 .tint(.blue)
+                                .help("Start over from saved video")
                             }
                         }
                         .swipeActions(edge: .leading, allowsFullSwipe: false) {
@@ -199,8 +205,10 @@ struct ContentView: View {
                                         "Reveal",
                                         systemImage: "magnifyingglass"
                                     )
+                                    .labelStyle(.iconOnly)
                                 }
                                 .tint(.indigo)
+                                .help("Reveal splat in Finder")
                             }
                         }
                         .contextMenu {

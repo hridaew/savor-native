@@ -123,6 +123,44 @@ Verification (all four captures, `scripts/verify-cleanup.sh`):
 | IMG_9033 (bottle, home) | 296,681 | 70,515 | bottle + its roller pedestal (one Vision instance); room gone — was **zero cleanup** |
 | IMG_0899 (KAWS, gallery) | 819,154 | 335,611 | isolated, intact — was **zero cleanup** |
 
+## Refinements from the research-preview feedback round
+
+- **Highest-threshold-first selection** (replaces "step down until 8%
+  kept"): a pedestal the masks include in only some frames scores ~0.6 —
+  stepping the threshold down into that mode kept it in shreds (the
+  "obliterated box" on IMG_1571). Starting at 0.9 and stopping at the first
+  threshold with a coherent core cuts flickering co-subjects whole while
+  degraded registrations still step down far enough to keep their subject.
+- **Extent-aware trim**: large soft splats ("spilled milk") hide their
+  center inside the dilated silhouette while the body hangs out — the tips
+  of the dominant axis are now consensus-tested too, and a tip that clearly
+  exits (ratio < 0.5) caps the splat's score.
+- **Registration-failure salvage**: a capture whose poses shattered (the
+  four-skull IMG_1569 re-runs — ring-distance spread 8×) can't score ~1.0
+  anywhere; the threshold floor at 0.5 plus the core-based veto now salvage
+  the dominant, most-consistent subject instead of skipping cleanup
+  entirely. The real fix for these captures is upstream in pose
+  estimation — see the object-masking experiment below.
+
+## Upstream: the shattered-registration problem (open)
+
+The wander-style capture (orbit + up/down/close/far, IMG_1569) breaks
+PhotogrammetrySession's sequential registration outright — camera
+ring-distance spread 8.6× vs ~1.8× on a healthy orbit, visible as
+duplicate subjects in the raw splat. Measured mitigation attempts:
+
+- `isObjectMaskingEnabled` (poses-cli now has `--object-masking`):
+  spread 8.6× → 6.1×. Helps, doesn't fix.
+- Cleanup-side salvage (shipped, above) keeps the dominant consistent
+  subject instead of shipping four broken ones.
+
+The promising real fix is **temporal-coherence frame filtering**: adjacent
+video frames must have adjacent cameras, so frames whose registered pose
+jumps discontinuously are mis-registered — drop them and re-register the
+coherent subset. Scoped as its own workstream; PoseSanity's current
+ring/facing checks pass these captures, so they'd also need a
+spread-based tightening once salvage-vs-reject UX is decided.
+
 ## Follow-ups
 
 - Existing captures need "Start Over from Saved Video" to pick up v6.
